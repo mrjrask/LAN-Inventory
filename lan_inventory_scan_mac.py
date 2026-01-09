@@ -2,6 +2,7 @@
 import csv
 import ipaddress
 import os
+import platform
 import shutil
 import socket
 import subprocess
@@ -10,7 +11,6 @@ import time
 import xml.etree.ElementTree as ET
 from typing import Dict, List, Tuple
 
-NETWORK_CIDR = "192.168.0.0/16"
 OUTPUT_CSV = "network_inventory.csv"
 
 
@@ -37,6 +37,66 @@ def prompt_timeout_seconds(default: int = 1200) -> int:
             return val
         except ValueError:
             print("Please enter a valid integer (seconds).")
+
+
+def _parse_default_interface(route_output: str) -> str:
+    for line in route_output.splitlines():
+        line = line.strip()
+        if line.startswith("interface:"):
+            return line.split("interface:", 1)[-1].strip()
+    return ""
+
+
+def _parse_ifconfig_inet(ifconfig_output: str) -> Tuple[str, int]:
+    for line in ifconfig_output.splitlines():
+        line = line.strip()
+        if not line.startswith("inet "):
+            continue
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        ip = parts[1]
+        netmask = parts[3]
+        if not netmask.startswith("0x"):
+            continue
+        mask_int = int(netmask, 16)
+        prefix_len = bin(mask_int).count("1")
+        return ip, prefix_len
+    return "", 0
+
+
+def get_active_network_cidr() -> str:
+    system = platform.system()
+    if system != "Darwin":
+        raise RuntimeError(f"Unsupported platform: {system}")
+
+    require_tool("route")
+    require_tool("ifconfig")
+
+    route_cp = subprocess.run(
+        ["route", "-n", "get", "default"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    interface = _parse_default_interface(route_cp.stdout)
+    if not interface:
+        raise RuntimeError("Could not determine default network interface.")
+
+    ifconfig_cp = subprocess.run(
+        ["ifconfig", interface],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    ip, prefix_len = _parse_ifconfig_inet(ifconfig_cp.stdout)
+    if not ip or prefix_len <= 0:
+        raise RuntimeError(f"Could not determine IPv4 network for interface {interface}.")
+
+    network = ipaddress.ip_network(f"{ip}/{prefix_len}", strict=False)
+    return str(network)
 
 
 def run_nmap_scan(network: str, timeout_s: int) -> str:
@@ -170,8 +230,9 @@ def main() -> int:
     timeout_s = prompt_timeout_seconds(default=1200)
 
     try:
-        print(f"Scanning range: {NETWORK_CIDR}")
-        xml_data = run_nmap_scan(NETWORK_CIDR, timeout_s)
+        network_cidr = get_active_network_cidr()
+        print(f"Scanning range: {network_cidr}")
+        xml_data = run_nmap_scan(network_cidr, timeout_s)
         rows = parse_nmap_xml(xml_data)
         write_csv(rows, OUTPUT_CSV)
 
