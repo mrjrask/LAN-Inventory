@@ -99,6 +99,52 @@ def get_active_network_cidr() -> str:
     return str(network)
 
 
+def _parse_netstat_routes(netstat_output: str) -> List[ipaddress.IPv4Network]:
+    networks: List[ipaddress.IPv4Network] = []
+    for line in netstat_output.splitlines():
+        line = line.strip()
+        if not line or line.startswith("Destination") or line.startswith("Internet"):
+            continue
+        parts = line.split()
+        if not parts:
+            continue
+        destination = parts[0]
+        if destination in {"default", "localhost"} or destination.startswith("link#"):
+            continue
+        if "/" not in destination:
+            continue
+        try:
+            network = ipaddress.ip_network(destination, strict=False)
+        except ValueError:
+            continue
+        if network.version != 4:
+            continue
+        networks.append(network)
+    return networks
+
+
+def get_scan_networks() -> List[str]:
+    primary_network = ipaddress.ip_network(get_active_network_cidr(), strict=False)
+    networks = {primary_network}
+
+    require_tool("netstat")
+    netstat_cp = subprocess.run(
+        ["netstat", "-rn", "-f", "inet"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    for network in _parse_netstat_routes(netstat_cp.stdout):
+        if network.is_loopback or network.is_unspecified:
+            continue
+        if not (network.is_private or network.is_link_local):
+            continue
+        networks.add(network)
+
+    return [str(n) for n in sorted(networks, key=lambda n: (int(n.network_address), n.prefixlen))]
+
+
 def run_nmap_scan(network: str, timeout_s: int) -> str:
     require_tool("nmap")
 
@@ -230,10 +276,20 @@ def main() -> int:
     timeout_s = prompt_timeout_seconds(default=1200)
 
     try:
-        network_cidr = get_active_network_cidr()
-        print(f"Scanning range: {network_cidr}")
-        xml_data = run_nmap_scan(network_cidr, timeout_s)
-        rows = parse_nmap_xml(xml_data)
+        networks = get_scan_networks()
+        print(f"Scanning ranges: {', '.join(networks)}")
+
+        combined: Dict[str, Dict[str, str]] = {}
+        for network_cidr in networks:
+            xml_data = run_nmap_scan(network_cidr, timeout_s)
+            rows = parse_nmap_xml(xml_data)
+            for row in rows:
+                combined.setdefault(row["ip_address"], row)
+
+        rows = sorted(
+            combined.values(),
+            key=lambda item: tuple(int(o) for o in item["ip_address"].split(".")),
+        )
         write_csv(rows, OUTPUT_CSV)
 
         print(f"Discovered {len(rows)} active hosts")
