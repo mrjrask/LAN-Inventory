@@ -97,6 +97,46 @@ def get_active_network_cidr() -> str:
     return str(network)
 
 
+def _parse_ip_route_routes(route_output: str) -> List[ipaddress.IPv4Network]:
+    networks: List[ipaddress.IPv4Network] = []
+    for line in route_output.splitlines():
+        line = line.strip()
+        if not line or line.startswith("default"):
+            continue
+        destination = line.split()[0]
+        if "/" not in destination:
+            continue
+        try:
+            network = ipaddress.ip_network(destination, strict=False)
+        except ValueError:
+            continue
+        if network.version != 4:
+            continue
+        networks.append(network)
+    return networks
+
+
+def get_scan_networks() -> List[str]:
+    primary_network = ipaddress.ip_network(get_active_network_cidr(), strict=False)
+    networks = {primary_network}
+
+    route_cp = subprocess.run(
+        ["ip", "route", "show"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    for network in _parse_ip_route_routes(route_cp.stdout):
+        if network.is_loopback or network.is_unspecified:
+            continue
+        if not (network.is_private or network.is_link_local):
+            continue
+        networks.add(network)
+
+    return [str(n) for n in sorted(networks, key=lambda n: (int(n.network_address), n.prefixlen))]
+
+
 def run_nmap_scan(network: str, timeout_s: int) -> str:
     require_tool("nmap")
 
@@ -215,10 +255,20 @@ def main() -> int:
     timeout_s = prompt_timeout_seconds(default=600)
 
     try:
-        network_cidr = get_active_network_cidr()
-        print(f"Scanning range: {network_cidr}")
-        xml_data = run_nmap_scan(network_cidr, timeout_s)
-        rows = parse_nmap_xml(xml_data)
+        networks = get_scan_networks()
+        print(f"Scanning ranges: {', '.join(networks)}")
+
+        combined: Dict[str, Dict[str, str]] = {}
+        for network_cidr in networks:
+            xml_data = run_nmap_scan(network_cidr, timeout_s)
+            rows = parse_nmap_xml(xml_data)
+            for row in rows:
+                combined.setdefault(row["ip_address"], row)
+
+        rows = sorted(
+            combined.values(),
+            key=lambda item: tuple(int(o) for o in item["ip_address"].split(".")),
+        )
         write_csv(rows, OUTPUT_CSV)
 
         print(f"Discovered {len(rows)} active hosts")
