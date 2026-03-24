@@ -23,6 +23,7 @@ Both scripts:
 | Script | Platform |
 |------|----------|
 | `lan_inventory_scan_pi.py` | Raspberry Pi OS (Bookworm & Trixie) |
+| `install_pi_dependencies.sh` | Raspberry Pi OS installer for scanner dependencies |
 | `lan_inventory_scan_mac.py` | macOS (26.2 and newer) |
 
 Both scripts are intentionally similar so results are consistent across platforms.
@@ -83,9 +84,18 @@ Example row:
 
 ### Requirements
 
+Use the included installer script (recommended):
+
+```bash
+chmod +x install_pi_dependencies.sh
+./install_pi_dependencies.sh
+```
+
+Or install manually:
+
 ```bash
 sudo apt update
-sudo apt install -y nmap python3
+sudo apt install -y nmap python3 iproute2
 ```
 
 ### Script Name
