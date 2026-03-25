@@ -1,20 +1,20 @@
-# LAN Inventory Scanner (Raspberry Pi & macOS)
+# LAN Inventory Scanner (Raspberry Pi)
 
-This project provides two terminal-based Python scripts that scan an entire private IPv4 range
-(`192.168.0.1` through `192.168.255.255`) and generate a CSV inventory of devices found on the local network.
+This project provides a terminal-based Python script that scans an entire private IPv4 range
+(`192.168.0.1` through `192.168.255.255`) and generates a CSV inventory of devices found on the local network.
 
-Both scripts:
+The script:
 
-- Prompt the user at launch for **how many seconds the scan should run**
-- Perform host discovery using **nmap**
-- Capture:
+- Prompts the user at launch for **how many seconds the scan should run**
+- Performs host discovery using **nmap**
+- Captures:
   - IP address
   - Hostname (as reported by nmap)
   - DNS name (reverse DNS / PTR lookup)
   - MAC address
   - Manufacturer (vendor/OUI)
-- Output a CSV file sorted by IP address
-- Work best when run with **administrator/root privileges**
+- Outputs a CSV file sorted by IP address
+- Works best when run with **administrator/root privileges**
 
 ---
 
@@ -24,9 +24,6 @@ Both scripts:
 |------|----------|
 | `lan_inventory_scan_pi.py` | Raspberry Pi OS (Bookworm & Trixie) |
 | `install_pi_dependencies.sh` | Raspberry Pi OS installer for scanner dependencies |
-| `lan_inventory_scan_mac.py` | macOS (26.2 and newer) |
-
-Both scripts are intentionally similar so results are consistent across platforms.
 
 ---
 
@@ -51,7 +48,7 @@ This ensures **maximum coverage** of typical home and small-business networks, e
 
 ## Output
 
-Both scripts generate:
+The script generates:
 
 ```
 network_inventory.csv
@@ -121,43 +118,6 @@ Enter the desired timeout in seconds, or press **Enter** to accept the default.
 
 ---
 
-## macOS Version
-
-### Supported OS Versions
-
-- macOS **26.2** and newer
-
-### Requirements
-
-Install Homebrew (if needed):
-
-```bash
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-```
-
-Install dependencies:
-
-```bash
-brew install nmap python
-```
-
-### Script Name
-
-```
-lan_inventory_scan_mac.py
-```
-
-### Run
-
-```bash
-chmod +x lan_inventory_scan_mac.py
-sudo ./lan_inventory_scan_mac.py
-```
-
-You will be prompted at launch for the scan duration (seconds).
-
----
-
 ## Why Root / sudo Is Strongly Recommended
 
 Running without elevated privileges will still work, but with limitations:
@@ -169,7 +129,7 @@ Running without elevated privileges will still work, but with limitations:
 | ARP discovery | Limited | Full |
 | Host visibility | Reduced | Maximum |
 
-For best results on **both Raspberry Pi and macOS**, always use `sudo`.
+For best results, always use `sudo`.
 
 ---
 
@@ -200,7 +160,7 @@ If you want:
 - Progress indicators / ETA
 - Resume / checkpointing
 - SQLite output instead of CSV
-- Scheduled scans (systemd timer or macOS launchd)
+- Scheduled scans (systemd timer)
 
 These can be added cleanly.
 
@@ -208,7 +168,7 @@ These can be added cleanly.
 
 ## Safety Notes
 
-- These scripts perform **host discovery only**
+- This script performs **host discovery only**
 - No ports are scanned
 - No services are touched
 - Safe for home and business networks where you have authorization
@@ -218,12 +178,3 @@ Do not run on networks you do not own or manage.
 ---
 
 ## Summary
-
-- One scan
-- One CSV
-- Maximum visibility
-- Works on Raspberry Pi and macOS
-- Explicit user-controlled scan duration
-
-This is designed to be a **trustworthy inventory baseline** you can automate or extend.
-
