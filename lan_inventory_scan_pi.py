@@ -244,6 +244,44 @@ def write_csv(rows: List[Dict[str, str]], path: str) -> None:
             writer.writerow({k: row.get(k, "") for k in fieldnames})
 
 
+def print_table(rows: List[Dict[str, str]]) -> None:
+    columns = [
+        ("IP Address", "ip_address"),
+        ("Hostname", "hostname"),
+        ("DNS Name", "dns_name"),
+        ("MAC Address", "mac_address"),
+        ("Manufacturer", "manufacturer"),
+    ]
+    if not rows:
+        print("No hosts found.")
+        return
+
+    max_col_width = 40
+    widths: List[int] = []
+    for title, key in columns:
+        max_value_len = max(len(str(row.get(key, ""))) for row in rows)
+        widths.append(min(max(len(title), max_value_len), max_col_width))
+
+    def fit(text: str, width: int) -> str:
+        if len(text) <= width:
+            return text.ljust(width)
+        if width <= 3:
+            return text[:width]
+        return f"{text[: width - 3]}...".ljust(width)
+
+    header = " | ".join(fit(title, width) for (title, _), width in zip(columns, widths))
+    separator = "-+-".join("-" * width for width in widths)
+    print("\nDiscovered Hosts:")
+    print(header)
+    print(separator)
+    for row in rows:
+        line = " | ".join(
+            fit(str(row.get(key, "")), width)
+            for (_, key), width in zip(columns, widths)
+        )
+        print(line)
+
+
 def main() -> int:
     if not is_root():
         print(
@@ -270,6 +308,7 @@ def main() -> int:
             key=lambda item: tuple(int(o) for o in item["ip_address"].split(".")),
         )
         write_csv(rows, OUTPUT_CSV)
+        print_table(rows)
 
         print(f"Discovered {len(rows)} active hosts")
         print(f"CSV written to: {OUTPUT_CSV}")

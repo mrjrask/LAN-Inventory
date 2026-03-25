@@ -14,6 +14,7 @@ The script:
   - MAC address
   - Manufacturer (vendor/OUI)
 - Outputs a CSV file sorted by IP address
+- Prints a formatted terminal table for quick viewing
 - Works best when run with **administrator/root privileges**
 
 ---
@@ -69,6 +70,16 @@ Example row:
 ```csv
 192.168.1.42,my-printer,printer.local,AA:BB:CC:DD:EE:FF,HP
 ```
+
+### CLI Table Output
+
+In addition to CSV export, the script prints a formatted table in the terminal showing:
+
+- IP Address
+- Hostname
+- DNS Name
+- MAC Address
+- Manufacturer
 
 ---
 
