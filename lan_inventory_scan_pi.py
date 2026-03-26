@@ -142,20 +142,50 @@ def run_nmap_scan(network: str, timeout_s: int) -> str:
 
     cmd = ["nmap", "-sn", network, "-oX", "-"]
 
-    print(f"Running scan: {' '.join(cmd)}")
-    start = time.time()
-
-    try:
-        cp = subprocess.run(
-            cmd,
+    def _run_scan(scan_cmd: List[str]) -> subprocess.CompletedProcess[str]:
+        print(f"Running scan: {' '.join(scan_cmd)}")
+        return subprocess.run(
+            scan_cmd,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=timeout_s,
             check=False,
         )
+
+    start = time.time()
+
+    try:
+        cp = _run_scan(cmd)
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"Scan exceeded timeout of {timeout_s} seconds")
+
+    retry_triggers = (
+        "Required key not available",
+        "Destination address required",
+    )
+    should_retry_unprivileged = any(trigger in cp.stderr for trigger in retry_triggers)
+    if should_retry_unprivileged:
+        print(
+            "Detected kernel policy/routing errors for raw ICMP probes; "
+            "retrying with unprivileged TCP ping probes.",
+            file=sys.stderr,
+        )
+        try:
+            cp = _run_scan(
+                [
+                    "nmap",
+                    "--unprivileged",
+                    "-sn",
+                    "-PS22,80,443",
+                    "-PA22,80,443",
+                    network,
+                    "-oX",
+                    "-",
+                ]
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"Scan exceeded timeout of {timeout_s} seconds")
 
     elapsed = time.time() - start
 
