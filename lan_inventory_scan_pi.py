@@ -2,6 +2,7 @@
 import argparse
 import concurrent.futures
 import csv
+import glob
 import ipaddress
 import json
 import os
@@ -28,6 +29,18 @@ RASPBERRY_PI_HOSTNAME_KEYWORDS = (
     "raspberry-pi",
     "raspberry_pi",
     "rpi",
+)
+
+# Common DHCP lease locations used by dnsmasq, NetworkManager shared
+# connections, and systemd-networkd. These often contain hostnames for
+# devices on Raspberry Pi hosted hotspot networks even when PTR DNS is absent.
+DHCP_LEASE_GLOBS = (
+    "/var/lib/misc/dnsmasq.leases",
+    "/var/lib/NetworkManager/dnsmasq*.leases",
+    "/var/lib/NetworkManager/*dnsmasq*.leases",
+    "/run/NetworkManager/dnsmasq*.leases",
+    "/run/NetworkManager/*dnsmasq*.leases",
+    "/run/systemd/netif/leases/*",
 )
 
 
@@ -457,9 +470,127 @@ def reverse_dns(ip: str) -> str:
         return ""
 
 
+def _clean_hostname(hostname: str) -> str:
+    hostname = hostname.strip()
+    if not hostname or hostname == "*":
+        return ""
+    return hostname
+
+
+def _parse_dnsmasq_lease_line(line: str) -> Tuple[str, str]:
+    parts = line.split()
+    if len(parts) < 4:
+        return "", ""
+    return parts[2], _clean_hostname(parts[3])
+
+
+def _parse_systemd_lease_text(text: str) -> Tuple[str, str]:
+    ip = ""
+    hostname = ""
+    for line in text.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key == "ADDRESS":
+            ip = value.strip()
+        elif key == "HOSTNAME":
+            hostname = _clean_hostname(value)
+    return ip, hostname
+
+
+def load_dhcp_lease_hostnames(lease_globs: Sequence[str] = DHCP_LEASE_GLOBS) -> Dict[str, str]:
+    hostnames: Dict[str, str] = {}
+    paths: Set[str] = set()
+    for pattern in lease_globs:
+        paths.update(glob.glob(pattern))
+
+    for path in sorted(paths):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except OSError:
+            continue
+
+        if "ADDRESS=" in text or "HOSTNAME=" in text:
+            ip, hostname = _parse_systemd_lease_text(text)
+            if ip and hostname:
+                hostnames.setdefault(ip, hostname)
+            continue
+
+        for line in text.splitlines():
+            ip, hostname = _parse_dnsmasq_lease_line(line)
+            if ip and hostname:
+                hostnames.setdefault(ip, hostname)
+
+    return hostnames
+
+
+def resolve_avahi_address(ip: str) -> str:
+    avahi_tool = shutil.which("avahi-resolve-address")
+    if avahi_tool is None:
+        return ""
+
+    cp = subprocess.run(
+        [avahi_tool, ip],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        timeout=3,
+        check=False,
+    )
+    if cp.returncode != 0:
+        return ""
+
+    parts = cp.stdout.strip().split()
+    if len(parts) >= 2 and parts[0] == ip:
+        return _clean_hostname(parts[1].rstrip("."))
+    return ""
+
+
+def _parse_avahi_browse_line(line: str) -> Tuple[str, str]:
+    # avahi-browse --parsable resolved lines are semicolon-separated and start
+    # with '='. The hostname and IPv4 address are the seventh and eighth fields.
+    parts = line.split(";")
+    if len(parts) < 8 or parts[0] != "=" or parts[2] != "IPv4":
+        return "", ""
+    hostname = _clean_hostname(parts[6].rstrip("."))
+    ip = parts[7].strip()
+    return ip, hostname
+
+
+def load_avahi_browse_hostnames() -> Dict[str, str]:
+    avahi_tool = shutil.which("avahi-browse")
+    if avahi_tool is None:
+        return {}
+
+    try:
+        cp = subprocess.run(
+            [avahi_tool, "--all", "--resolve", "--terminate", "--parsable"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {}
+
+    if cp.returncode != 0:
+        return {}
+
+    hostnames: Dict[str, str] = {}
+    for line in cp.stdout.splitlines():
+        ip, hostname = _parse_avahi_browse_line(line)
+        if ip and hostname:
+            hostnames.setdefault(ip, hostname)
+    return hostnames
+
+
 def parse_nmap_xml(xml_text: str) -> List[Dict[str, str]]:
     root = ET.fromstring(xml_text)
     results: List[Dict[str, str]] = []
+    dhcp_lease_hostnames = load_dhcp_lease_hostnames()
+    avahi_browse_hostnames = load_avahi_browse_hostnames()
 
     for host in root.findall("host"):
         status = host.find("status")
@@ -490,11 +621,16 @@ def parse_nmap_xml(xml_text: str) -> List[Dict[str, str]]:
                 nmap_hostname = hn.get("name", "") or ""
 
         dns_name = reverse_dns(ip)
+        lease_hostname = dhcp_lease_hostnames.get(ip, "")
+        avahi_hostname = avahi_browse_hostnames.get(ip, "")
+        if not (dns_name or lease_hostname or nmap_hostname or avahi_hostname):
+            avahi_hostname = resolve_avahi_address(ip)
+        hostname = nmap_hostname or lease_hostname or avahi_hostname or dns_name
 
         results.append(
             {
                 "ip_address": ip,
-                "hostname": nmap_hostname,
+                "hostname": hostname,
                 "dns_name": dns_name,
                 "mac_address": mac,
                 "manufacturer": vendor,
