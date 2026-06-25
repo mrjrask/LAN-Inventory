@@ -5,7 +5,7 @@ This project provides a terminal-based Python script that scans an entire privat
 
 The script:
 
-- Prompts the user at launch for **how many seconds the scan should run**
+- Prompts the user at launch for **how many seconds the scan should run** unless `--timeout` is provided
 - Performs host discovery using **nmap**
 - Captures:
   - IP address
@@ -14,6 +14,7 @@ The script:
   - MAC address
   - Manufacturer (vendor/OUI)
 - Outputs a CSV file sorted by IP address
+- Can filter output to likely Raspberry Pi devices with `--raspberry-pis` / `--pis`
 - Prints a formatted terminal table for quick viewing
 - Works best when run with **administrator/root privileges**
 
@@ -119,7 +120,27 @@ chmod +x lan_inventory_scan_pi.py
 sudo ./lan_inventory_scan_pi.py
 ```
 
-At launch, the script will ask:
+To skip the interactive timeout prompt:
+
+```bash
+sudo ./lan_inventory_scan_pi.py --timeout 600
+```
+
+To show only likely Raspberry Pi devices, with their IP addresses and hostnames, run:
+
+```bash
+sudo ./lan_inventory_scan_pi.py --raspberry-pis --timeout 600
+```
+
+The shorter alias is also supported:
+
+```bash
+sudo ./lan_inventory_scan_pi.py --pis --timeout 600
+```
+
+Yes: manufacturer matching helps a lot when nmap can see each device MAC address. Raspberry Pi filtering first checks whether the MAC vendor/manufacturer identifies Raspberry Pi hardware, then falls back to nmap hostname / reverse DNS names containing common Raspberry Pi names such as `raspberrypi`, `raspberry-pi`, `raspberry_pi`, or `rpi`.
+
+At launch, without `--timeout`, the script will ask:
 
 ```
 How many seconds should the scan run for? [600]:
@@ -153,7 +174,7 @@ For best results, always use `sudo`.
   - Result of a strict reverse DNS (PTR) lookup
   - Often empty on home networks unless your router maintains PTR records
 
-They may differ — this is expected and intentional.
+They may differ — this is expected and intentional. The Raspberry Pi-only flag checks both values so it can still find devices when MAC vendor information is unavailable.
 
 ---
 
