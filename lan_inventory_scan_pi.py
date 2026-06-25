@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import csv
 import ipaddress
 import os
@@ -9,9 +10,21 @@ import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
-from typing import Dict, List, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 OUTPUT_CSV = "network_inventory.csv"
+# nmap populates this from the MAC address OUI when it can see the device MAC.
+RASPBERRY_PI_MANUFACTURER_KEYWORDS = (
+    "raspberry pi",
+    "raspberry pi foundation",
+    "raspberry pi trading",
+)
+RASPBERRY_PI_HOSTNAME_KEYWORDS = (
+    "raspberrypi",
+    "raspberry-pi",
+    "raspberry_pi",
+    "rpi",
+)
 
 
 def require_tool(tool: str) -> None:
@@ -22,6 +35,32 @@ def require_tool(tool: str) -> None:
 
 def is_root() -> bool:
     return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Scan local IPv4 networks and inventory discovered LAN hosts."
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        help="Maximum seconds to allow each network scan to run. Skips the interactive prompt.",
+    )
+    parser.add_argument(
+        "--raspberry-pis",
+        "--pis",
+        action="store_true",
+        help="Show only likely Raspberry Pi devices with their IP addresses and hostnames.",
+    )
+    return parser.parse_args(argv)
+
+
+def get_timeout_seconds(args: argparse.Namespace, default: int = 600) -> int:
+    if args.timeout is None:
+        return prompt_timeout_seconds(default=default)
+    if args.timeout <= 0:
+        raise ValueError("--timeout must be a positive integer.")
+    return args.timeout
 
 
 def prompt_timeout_seconds(default: int = 600) -> int:
@@ -265,6 +304,33 @@ def parse_nmap_xml(xml_text: str) -> List[Dict[str, str]]:
     return results
 
 
+def is_likely_raspberry_pi(row: Dict[str, str]) -> bool:
+    manufacturer = row.get("manufacturer", "").lower()
+    hostname = row.get("hostname", "").lower()
+    dns_name = row.get("dns_name", "").lower()
+
+    return any(keyword in manufacturer for keyword in RASPBERRY_PI_MANUFACTURER_KEYWORDS) or any(
+        keyword in name
+        for keyword in RASPBERRY_PI_HOSTNAME_KEYWORDS
+        for name in (hostname, dns_name)
+    )
+
+
+def filter_raspberry_pis(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    return [row for row in rows if is_likely_raspberry_pi(row)]
+
+
+def print_raspberry_pi_summary(rows: List[Dict[str, str]]) -> None:
+    if not rows:
+        print("No likely Raspberry Pi devices found.")
+        return
+
+    print("\nLikely Raspberry Pi Devices:")
+    for row in rows:
+        hostname = row.get("hostname") or row.get("dns_name") or "(unknown hostname)"
+        print(f"{row.get('ip_address', '')}\t{hostname}")
+
+
 def write_csv(rows: List[Dict[str, str]], path: str) -> None:
     fieldnames = ["ip_address", "hostname", "dns_name", "mac_address", "manufacturer"]
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -312,7 +378,8 @@ def print_table(rows: List[Dict[str, str]]) -> None:
         print(line)
 
 
-def main() -> int:
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv if argv is not None else sys.argv[1:])
     if not is_root():
         print(
             "WARNING: Run as root for best MAC/manufacturer detection.\n"
@@ -320,9 +387,8 @@ def main() -> int:
             file=sys.stderr,
         )
 
-    timeout_s = prompt_timeout_seconds(default=600)
-
     try:
+        timeout_s = get_timeout_seconds(args, default=600)
         networks = get_scan_networks()
         print(f"Scanning ranges: {', '.join(networks)}")
 
@@ -337,10 +403,19 @@ def main() -> int:
             combined.values(),
             key=lambda item: tuple(int(o) for o in item["ip_address"].split(".")),
         )
-        write_csv(rows, OUTPUT_CSV)
-        print_table(rows)
+        if args.raspberry_pis:
+            display_rows = filter_raspberry_pis(rows)
+            print_raspberry_pi_summary(display_rows)
+            print(
+                f"Found {len(display_rows)} likely Raspberry Pi device(s) "
+                f"out of {len(rows)} active hosts"
+            )
+        else:
+            display_rows = rows
+            print_table(display_rows)
+            print(f"Discovered {len(rows)} active hosts")
 
-        print(f"Discovered {len(rows)} active hosts")
+        write_csv(display_rows, OUTPUT_CSV)
         print(f"CSV written to: {OUTPUT_CSV}")
         return 0
 
