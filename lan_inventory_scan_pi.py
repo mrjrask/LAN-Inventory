@@ -283,10 +283,19 @@ def print_progress(completed: int, total: int, start_time: float) -> None:
     )
 
 
-def run_nmap_scan(network: str, timeout_s: int) -> str:
+def run_nmap_scan(network: str, timeout_s: float) -> str:
     require_tool("nmap")
 
     cmd = ["nmap", "-sn", network, "-oX", "-"]
+
+    start = time.time()
+    deadline = start + timeout_s
+
+    def _remaining_timeout() -> float:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(cmd, timeout_s)
+        return remaining
 
     def _run_scan(scan_cmd: List[str]) -> subprocess.CompletedProcess[str]:
         print(f"Running scan: {' '.join(scan_cmd)}")
@@ -295,16 +304,14 @@ def run_nmap_scan(network: str, timeout_s: int) -> str:
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=timeout_s,
+            timeout=_remaining_timeout(),
             check=False,
         )
-
-    start = time.time()
 
     try:
         cp = _run_scan(cmd)
     except subprocess.TimeoutExpired:
-        raise RuntimeError(f"Scan exceeded timeout of {timeout_s} seconds")
+        raise RuntimeError(f"Scan exceeded timeout of {format_duration(timeout_s)}")
 
     retry_triggers = (
         "Required key not available",
@@ -331,7 +338,7 @@ def run_nmap_scan(network: str, timeout_s: int) -> str:
                 ]
             )
         except subprocess.TimeoutExpired:
-            raise RuntimeError(f"Scan exceeded timeout of {timeout_s} seconds")
+            raise RuntimeError(f"Scan exceeded timeout of {format_duration(timeout_s)}")
 
     elapsed = time.time() - start
 
@@ -348,14 +355,14 @@ def run_nmap_scan(network: str, timeout_s: int) -> str:
     return cp.stdout
 
 
-def scan_chunk(network: str, timeout_s: int) -> Tuple[str, List[Dict[str, str]]]:
+def scan_chunk(network: str, timeout_s: float) -> Tuple[str, List[Dict[str, str]]]:
     xml_data = run_nmap_scan(network, timeout_s)
     return network, parse_nmap_xml(xml_data)
 
 
 def scan_chunks(
     chunks: List[str],
-    timeout_s: int,
+    timeout_s: float,
     workers: int,
     checkpoint_path: str,
     resume: bool,
@@ -363,42 +370,78 @@ def scan_chunks(
     completed_chunks, combined = load_checkpoint(checkpoint_path, resume=resume)
     pending_chunks = [chunk for chunk in chunks if chunk not in completed_chunks]
 
-    if completed_chunks:
+    if completed_chunks and not pending_chunks:
+        print(
+            "Checkpoint already contains every requested chunk; starting a fresh scan "
+            "so completed results do not hide current network changes."
+        )
+        completed_chunks = set()
+        combined = {}
+        pending_chunks = list(chunks)
+    elif completed_chunks:
         print(f"Skipping {len(chunks) - len(pending_chunks)} already completed chunk(s).")
-    if not pending_chunks:
-        print("All chunks were already completed in the checkpoint.")
-        return combined
 
     print(f"Scanning {len(pending_chunks)} /24 chunk(s) with {workers} worker(s).")
     start_time = time.time()
+    deadline = start_time + timeout_s
     finished_this_run = 0
     print_progress(finished_this_run, len(pending_chunks), start_time)
 
+    def remaining_budget() -> float:
+        return deadline - time.time()
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-        future_to_chunk = {
-            executor.submit(scan_chunk, chunk, timeout_s): chunk for chunk in pending_chunks
-        }
-        for future in concurrent.futures.as_completed(future_to_chunk):
-            chunk = future_to_chunk[future]
+        chunk_iter = iter(pending_chunks)
+        future_to_chunk: Dict[concurrent.futures.Future[Tuple[str, List[Dict[str, str]]]], str] = {}
+
+        def submit_next_chunk() -> bool:
+            if remaining_budget() <= 0:
+                return False
             try:
-                completed_chunk, rows = future.result()
-            except Exception as exc:
+                next_chunk = next(chunk_iter)
+            except StopIteration:
+                return False
+            future_to_chunk[executor.submit(scan_chunk, next_chunk, remaining_budget())] = next_chunk
+            return True
+
+        for _ in range(min(workers, len(pending_chunks))):
+            submit_next_chunk()
+
+        while future_to_chunk:
+            done, _not_done = concurrent.futures.wait(
+                future_to_chunk,
+                timeout=max(0.0, remaining_budget()),
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            if not done:
                 save_checkpoint(checkpoint_path, completed_chunks, combined)
                 raise RuntimeError(
-                    f"Chunk {chunk} failed: {exc}. "
+                    f"Global scan timeout of {format_duration(timeout_s)} exceeded. "
                     f"Checkpoint saved to {checkpoint_path}; rerun to resume."
-                ) from exc
+                )
 
-            for row in rows:
-                combined.setdefault(row["ip_address"], row)
-            completed_chunks.add(completed_chunk)
-            finished_this_run += 1
-            save_checkpoint(checkpoint_path, completed_chunks, combined)
-            print(
-                f"Completed {completed_chunk}: {len(rows)} active host(s), "
-                f"{len(combined)} unique host(s) total."
-            )
-            print_progress(finished_this_run, len(pending_chunks), start_time)
+            for future in done:
+                chunk = future_to_chunk.pop(future)
+                try:
+                    completed_chunk, rows = future.result()
+                except Exception as exc:
+                    save_checkpoint(checkpoint_path, completed_chunks, combined)
+                    raise RuntimeError(
+                        f"Chunk {chunk} failed: {exc}. "
+                        f"Checkpoint saved to {checkpoint_path}; rerun to resume."
+                    ) from exc
+
+                for row in rows:
+                    combined.setdefault(row["ip_address"], row)
+                completed_chunks.add(completed_chunk)
+                finished_this_run += 1
+                save_checkpoint(checkpoint_path, completed_chunks, combined)
+                print(
+                    f"Completed {completed_chunk}: {len(rows)} active host(s), "
+                    f"{len(combined)} unique host(s) total."
+                )
+                print_progress(finished_this_run, len(pending_chunks), start_time)
+                submit_next_chunk()
 
     return combined
 
