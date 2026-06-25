@@ -7,6 +7,9 @@ The script:
 
 - Prompts the user at launch for **how many seconds the scan should run** unless `--timeout` is provided
 - Performs host discovery using **nmap**
+- Splits broad IPv4 ranges into parallel `/24` scan chunks
+- Shows scan progress, elapsed time, and ETA while chunks complete
+- Saves a checkpoint after each chunk so interrupted scans can resume
 - Captures:
   - IP address
   - Hostname (as reported by nmap)
@@ -126,6 +129,18 @@ To skip the interactive timeout prompt:
 sudo ./lan_inventory_scan_pi.py --timeout 600
 ```
 
+Scan chunks run in parallel by default. Adjust concurrency with `--workers`:
+
+```bash
+sudo ./lan_inventory_scan_pi.py --timeout 600 --workers 8
+```
+
+The script writes a resume checkpoint to `.lan_inventory_checkpoint.json` after each completed chunk. If a scan is interrupted, rerun the same command to skip completed chunks and continue. Use `--no-resume` to ignore an existing checkpoint, `--checkpoint PATH` to choose a different checkpoint file, or `--clear-checkpoint` to delete the checkpoint after a successful scan:
+
+```bash
+sudo ./lan_inventory_scan_pi.py --timeout 600 --workers 8 --clear-checkpoint
+```
+
 To show only likely Raspberry Pi devices, with their IP addresses and hostnames, run:
 
 ```bash
@@ -187,14 +202,7 @@ Typical scan times:
 - Busy or filtered networks: longer
 - Wi-Fi environments: slower than wired
 
-If you want:
-- Parallel `/24` chunk scanning
-- Progress indicators / ETA
-- Resume / checkpointing
-- SQLite output instead of CSV
-- Scheduled scans (systemd timer)
-
-These can be added cleanly.
+Implemented scanner features include parallel `/24` chunk scanning, progress / ETA output, and resume checkpointing. Future enhancements that can be added cleanly include SQLite output and scheduled scans with a systemd timer.
 
 ---
 

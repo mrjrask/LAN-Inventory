@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import argparse
+import concurrent.futures
 import csv
 import ipaddress
+import json
 import os
 import platform
 import shutil
@@ -10,9 +12,11 @@ import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
-from typing import Dict, List, Sequence, Tuple
+from datetime import datetime, timezone
+from typing import Dict, Iterable, List, Sequence, Set, Tuple
 
 OUTPUT_CSV = "network_inventory.csv"
+DEFAULT_CHECKPOINT_PATH = ".lan_inventory_checkpoint.json"
 # nmap populates this from the MAC address OUI when it can see the device MAC.
 RASPBERRY_PI_MANUFACTURER_KEYWORDS = (
     "raspberry pi",
@@ -52,6 +56,27 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         action="store_true",
         help="Show only likely Raspberry Pi devices with their IP addresses and hostnames.",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Number of /24 chunks to scan in parallel (default: 4).",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        default=DEFAULT_CHECKPOINT_PATH,
+        help=f"Path to resume checkpoint file (default: {DEFAULT_CHECKPOINT_PATH}).",
+    )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Ignore any existing checkpoint and start a fresh scan.",
+    )
+    parser.add_argument(
+        "--clear-checkpoint",
+        action="store_true",
+        help="Remove the checkpoint file after a successful scan.",
+    )
     return parser.parse_args(argv)
 
 
@@ -61,6 +86,12 @@ def get_timeout_seconds(args: argparse.Namespace, default: int = 600) -> int:
     if args.timeout <= 0:
         raise ValueError("--timeout must be a positive integer.")
     return args.timeout
+
+
+def get_worker_count(args: argparse.Namespace) -> int:
+    if args.workers <= 0:
+        raise ValueError("--workers must be a positive integer.")
+    return args.workers
 
 
 def prompt_timeout_seconds(default: int = 600) -> int:
@@ -176,6 +207,82 @@ def get_scan_networks() -> List[str]:
     return [str(n) for n in sorted(networks, key=lambda n: (int(n.network_address), n.prefixlen))]
 
 
+def expand_to_24_chunks(networks: Iterable[str]) -> List[str]:
+    chunks: Set[ipaddress.IPv4Network] = set()
+    for network_text in networks:
+        network = ipaddress.ip_network(network_text, strict=False)
+        if network.version != 4:
+            continue
+        if network.prefixlen <= 24:
+            chunks.update(network.subnets(new_prefix=24))
+        else:
+            chunks.add(network)
+    return [str(n) for n in sorted(chunks, key=lambda n: (int(n.network_address), n.prefixlen))]
+
+
+def load_checkpoint(path: str, resume: bool) -> Tuple[Set[str], Dict[str, Dict[str, str]]]:
+    if not resume or not os.path.exists(path):
+        return set(), {}
+
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    completed = set(data.get("completed_chunks", []))
+    hosts = {
+        ip: row
+        for ip, row in data.get("hosts", {}).items()
+        if isinstance(ip, str) and isinstance(row, dict)
+    }
+    print(
+        f"Resuming from checkpoint: {len(completed)} completed chunk(s), "
+        f"{len(hosts)} discovered host(s)."
+    )
+    return completed, hosts
+
+
+def save_checkpoint(path: str, completed_chunks: Set[str], hosts: Dict[str, Dict[str, str]]) -> None:
+    data = {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "completed_chunks": sorted(
+            completed_chunks,
+            key=lambda n: int(ipaddress.ip_network(n, strict=False).network_address),
+        ),
+        "hosts": hosts,
+    }
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    temp_path = f"{path}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(temp_path, path)
+
+
+def format_duration(seconds: float) -> str:
+    if seconds < 0 or seconds == float("inf"):
+        return "unknown"
+    minutes, secs = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def print_progress(completed: int, total: int, start_time: float) -> None:
+    elapsed = time.time() - start_time
+    if completed:
+        eta = (elapsed / completed) * (total - completed)
+    else:
+        eta = float("inf")
+    percent = (completed / total * 100) if total else 100
+    print(
+        f"Progress: {completed}/{total} chunks ({percent:.1f}%) | "
+        f"elapsed {format_duration(elapsed)} | ETA {format_duration(eta)}"
+    )
+
+
 def run_nmap_scan(network: str, timeout_s: int) -> str:
     require_tool("nmap")
 
@@ -239,6 +346,61 @@ def run_nmap_scan(network: str, timeout_s: int) -> str:
 
     print(f"Scan completed in {elapsed:.1f} seconds. Parsing results...")
     return cp.stdout
+
+
+def scan_chunk(network: str, timeout_s: int) -> Tuple[str, List[Dict[str, str]]]:
+    xml_data = run_nmap_scan(network, timeout_s)
+    return network, parse_nmap_xml(xml_data)
+
+
+def scan_chunks(
+    chunks: List[str],
+    timeout_s: int,
+    workers: int,
+    checkpoint_path: str,
+    resume: bool,
+) -> Dict[str, Dict[str, str]]:
+    completed_chunks, combined = load_checkpoint(checkpoint_path, resume=resume)
+    pending_chunks = [chunk for chunk in chunks if chunk not in completed_chunks]
+
+    if completed_chunks:
+        print(f"Skipping {len(chunks) - len(pending_chunks)} already completed chunk(s).")
+    if not pending_chunks:
+        print("All chunks were already completed in the checkpoint.")
+        return combined
+
+    print(f"Scanning {len(pending_chunks)} /24 chunk(s) with {workers} worker(s).")
+    start_time = time.time()
+    finished_this_run = 0
+    print_progress(finished_this_run, len(pending_chunks), start_time)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_chunk = {
+            executor.submit(scan_chunk, chunk, timeout_s): chunk for chunk in pending_chunks
+        }
+        for future in concurrent.futures.as_completed(future_to_chunk):
+            chunk = future_to_chunk[future]
+            try:
+                completed_chunk, rows = future.result()
+            except Exception as exc:
+                save_checkpoint(checkpoint_path, completed_chunks, combined)
+                raise RuntimeError(
+                    f"Chunk {chunk} failed: {exc}. "
+                    f"Checkpoint saved to {checkpoint_path}; rerun to resume."
+                ) from exc
+
+            for row in rows:
+                combined.setdefault(row["ip_address"], row)
+            completed_chunks.add(completed_chunk)
+            finished_this_run += 1
+            save_checkpoint(checkpoint_path, completed_chunks, combined)
+            print(
+                f"Completed {completed_chunk}: {len(rows)} active host(s), "
+                f"{len(combined)} unique host(s) total."
+            )
+            print_progress(finished_this_run, len(pending_chunks), start_time)
+
+    return combined
 
 
 def reverse_dns(ip: str) -> str:
@@ -389,15 +551,19 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         timeout_s = get_timeout_seconds(args, default=600)
+        workers = get_worker_count(args)
         networks = get_scan_networks()
         print(f"Scanning ranges: {', '.join(networks)}")
+        chunks = expand_to_24_chunks(networks)
+        print(f"Expanded to /24 scan chunks: {', '.join(chunks)}")
 
-        combined: Dict[str, Dict[str, str]] = {}
-        for network_cidr in networks:
-            xml_data = run_nmap_scan(network_cidr, timeout_s)
-            rows = parse_nmap_xml(xml_data)
-            for row in rows:
-                combined.setdefault(row["ip_address"], row)
+        combined = scan_chunks(
+            chunks=chunks,
+            timeout_s=timeout_s,
+            workers=workers,
+            checkpoint_path=args.checkpoint,
+            resume=not args.no_resume,
+        )
 
         rows = sorted(
             combined.values(),
@@ -417,6 +583,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         write_csv(display_rows, OUTPUT_CSV)
         print(f"CSV written to: {OUTPUT_CSV}")
+        if args.clear_checkpoint and os.path.exists(args.checkpoint):
+            os.remove(args.checkpoint)
+            print(f"Removed checkpoint: {args.checkpoint}")
         return 0
 
     except Exception as e:
