@@ -123,6 +123,41 @@ chmod +x lan_inventory_scan_pi.py
 sudo ./lan_inventory_scan_pi.py
 ```
 
+
+### Command-Line Flags
+
+Run `./lan_inventory_scan_pi.py --help` to print the built-in help text. The scanner supports these flags:
+
+| Flag | Value | Default | Description |
+|------|-------|---------|-------------|
+| `-h`, `--help` | none | n/a | Prints the command-line help and exits without scanning. |
+| `--timeout` | positive integer seconds | interactive prompt, default prompt value `600` | Sets the total scan time budget in seconds and skips the launch prompt. The value must be greater than zero. |
+| `--raspberry-pis`, `--pis` | none | disabled | Filters the terminal output and CSV to only likely Raspberry Pi devices. Matching uses Raspberry Pi MAC vendor/manufacturer data first, then common Raspberry Pi hostname and reverse-DNS patterns. |
+| `--workers` | positive integer | `4` | Sets how many scan chunks run in parallel. Higher values can finish faster but may increase CPU, network, and router load. The value must be greater than zero. |
+| `--checkpoint` | filesystem path | `.lan_inventory_checkpoint.json` | Chooses where scan progress is saved. Completed chunks and discovered hosts are written after each chunk so interrupted scans can resume. |
+| `--no-resume` | none | disabled | Ignores any existing checkpoint file and starts a fresh scan. The checkpoint path is still used for saving progress during the new run. |
+| `--clear-checkpoint` | none | disabled | Deletes the checkpoint file after a successful scan. This is useful when you do not want a completed checkpoint to remain after CSV output is written. |
+
+Common examples:
+
+```bash
+# Run for ten minutes using the default checkpoint and four workers
+sudo ./lan_inventory_scan_pi.py --timeout 600
+
+# Run with more parallel scan chunks
+sudo ./lan_inventory_scan_pi.py --timeout 600 --workers 8
+
+# Save progress to a custom checkpoint path
+sudo ./lan_inventory_scan_pi.py --timeout 600 --checkpoint ./checkpoints/home-lan.json
+
+# Start fresh even if a checkpoint exists, then remove the checkpoint after success
+sudo ./lan_inventory_scan_pi.py --timeout 600 --no-resume --clear-checkpoint
+
+# Output only likely Raspberry Pi devices
+sudo ./lan_inventory_scan_pi.py --timeout 600 --raspberry-pis
+sudo ./lan_inventory_scan_pi.py --timeout 600 --pis
+```
+
 To skip the interactive timeout prompt:
 
 ```bash
