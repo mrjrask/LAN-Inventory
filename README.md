@@ -12,7 +12,7 @@ The script:
 - Saves a checkpoint after each chunk so interrupted scans can resume
 - Captures:
   - IP address
-  - Hostname (as reported by nmap)
+  - Hostname (from nmap, local DHCP leases, reverse DNS, or mDNS/Avahi fallback)
   - DNS name (reverse DNS / PTR lookup)
   - MAC address
   - Manufacturer (vendor/OUI)
@@ -64,7 +64,7 @@ network_inventory.csv
 | Column | Description |
 |------|-------------|
 | `ip_address` | IPv4 address of the host |
-| `hostname` | Hostname reported by nmap (DNS, mDNS, NetBIOS, etc.) |
+| `hostname` | Hostname from nmap first, then local DHCP lease files, then Avahi/mDNS service discovery or address resolution, then reverse DNS |
 | `dns_name` | Reverse DNS (PTR record lookup); may be empty |
 | `mac_address` | MAC address (best on local L2 networks) |
 | `manufacturer` | Vendor derived from MAC OUI |
@@ -188,7 +188,7 @@ The shorter alias is also supported:
 sudo ./lan_inventory_scan_pi.py --pis --timeout 600
 ```
 
-Yes: manufacturer matching helps a lot when nmap can see each device MAC address. Raspberry Pi filtering first checks whether the MAC vendor/manufacturer identifies Raspberry Pi hardware, then falls back to nmap hostname / reverse DNS names containing common Raspberry Pi names such as `raspberrypi`, `raspberry-pi`, `raspberry_pi`, or `rpi`.
+Yes: manufacturer matching helps a lot when nmap can see each device MAC address. Raspberry Pi filtering first checks whether the MAC vendor/manufacturer identifies Raspberry Pi hardware, then falls back to discovered hostname / reverse DNS names containing common Raspberry Pi names such as `raspberrypi`, `raspberry-pi`, `raspberry_pi`, or `rpi`.
 
 At launch, without `--timeout`, the script will ask:
 
@@ -218,13 +218,15 @@ For best results, always use `sudo`.
 ## Hostname vs DNS Name (Important Distinction)
 
 - **hostname**
-  - Reported by nmap
-  - May come from DNS, mDNS (`.local`), NetBIOS, or other discovery methods
+  - Uses nmap-reported names first
+  - Falls back to local DHCP lease files used by common Raspberry Pi hotspot setups (for example dnsmasq, NetworkManager shared connections, and systemd-networkd)
+  - Falls back again to Avahi/mDNS service discovery when `avahi-browse` is installed, then per-host mDNS address resolution when `avahi-resolve-address` is installed
+  - Falls back to the reverse-DNS value when that is the only discovered name
 - **dns_name**
   - Result of a strict reverse DNS (PTR) lookup
   - Often empty on home networks unless your router maintains PTR records
 
-They may differ — this is expected and intentional. The Raspberry Pi-only flag checks both values so it can still find devices when MAC vendor information is unavailable.
+They may differ — this is expected and intentional. On Raspberry Pi hotspot networks, reverse DNS is often empty, but the hotspot DHCP lease file can still provide the client hostname. The Raspberry Pi-only flag checks both values so it can still find devices when MAC vendor information is unavailable.
 
 ---
 

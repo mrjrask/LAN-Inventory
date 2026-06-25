@@ -8,7 +8,10 @@ from lan_inventory_scan_pi import (
     filter_raspberry_pis,
     format_duration,
     load_checkpoint,
+    load_avahi_browse_hostnames,
+    load_dhcp_lease_hostnames,
     is_likely_raspberry_pi,
+    parse_nmap_xml,
     save_checkpoint,
     scan_chunks,
 )
@@ -44,6 +47,131 @@ class RaspberryPiFilterTests(unittest.TestCase):
         ]
 
         self.assertEqual(filter_raspberry_pis(rows), [rows[0]])
+
+
+class HostnameResolutionTests(unittest.TestCase):
+    def test_loads_dnsmasq_lease_hostnames(self):
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as temp:
+            temp.write(
+                "1719300000 b8:27:eb:12:34:56 10.42.0.54 "
+                "mirror-pi 01:b8:27:eb:12:34:56\n"
+            )
+            temp.write(
+                "1719300001 dc:a6:32:12:34:56 10.42.0.134 "
+                "* 01:dc:a6:32:12:34:56\n"
+            )
+            lease_path = temp.name
+
+        try:
+            self.assertEqual(
+                load_dhcp_lease_hostnames([lease_path]), {"10.42.0.54": "mirror-pi"}
+            )
+        finally:
+            Path(lease_path).unlink(missing_ok=True)
+
+    def test_loads_avahi_browse_hostnames(self):
+        avahi_output = (
+            "=;wlan0;IPv4;mirror-pi SSH;_ssh._tcp;local;"
+            "mirror-pi.local;10.42.0.54;22;\n"
+        )
+        with mock.patch(
+            "lan_inventory_scan_pi.shutil.which", return_value="avahi-browse"
+        ), mock.patch("lan_inventory_scan_pi.subprocess.run") as mocked_run:
+            mocked_run.return_value.returncode = 0
+            mocked_run.return_value.stdout = avahi_output
+
+            self.assertEqual(
+                load_avahi_browse_hostnames(), {"10.42.0.54": "mirror-pi.local"}
+            )
+
+    def test_parse_nmap_xml_uses_dhcp_lease_hostname_when_dns_is_missing(self):
+        xml = """<?xml version=\"1.0\"?>
+<nmaprun>
+  <host>
+    <status state=\"up\"/>
+    <address addr=\"10.42.0.54\" addrtype=\"ipv4\"/>
+    <address
+      addr=\"B8:27:EB:12:34:56\"
+      addrtype=\"mac\"
+      vendor=\"Raspberry Pi Trading Ltd\"
+    />
+    <hostnames/>
+  </host>
+</nmaprun>
+"""
+        with mock.patch("lan_inventory_scan_pi.reverse_dns", return_value=""), mock.patch(
+            "lan_inventory_scan_pi.load_dhcp_lease_hostnames",
+            return_value={"10.42.0.54": "mirror-pi"},
+        ), mock.patch(
+            "lan_inventory_scan_pi.load_avahi_browse_hostnames", return_value={}
+        ), mock.patch("lan_inventory_scan_pi.resolve_avahi_address") as mocked_avahi:
+            rows = parse_nmap_xml(xml)
+
+        self.assertEqual(rows[0]["hostname"], "mirror-pi")
+        mocked_avahi.assert_not_called()
+
+    def test_parse_nmap_xml_falls_back_to_avahi_for_unknown_hotspot_host(self):
+        xml = """<?xml version=\"1.0\"?>
+<nmaprun>
+  <host>
+    <status state=\"up\"/>
+    <address addr=\"10.42.0.175\" addrtype=\"ipv4\"/>
+    <hostnames/>
+  </host>
+</nmaprun>
+"""
+        with mock.patch("lan_inventory_scan_pi.reverse_dns", return_value=""), mock.patch(
+            "lan_inventory_scan_pi.load_dhcp_lease_hostnames", return_value={}
+        ), mock.patch(
+            "lan_inventory_scan_pi.load_avahi_browse_hostnames", return_value={}
+        ), mock.patch(
+            "lan_inventory_scan_pi.resolve_avahi_address", return_value="sensor-pi.local"
+        ):
+            rows = parse_nmap_xml(xml)
+
+        self.assertEqual(rows[0]["hostname"], "sensor-pi.local")
+
+    def test_parse_nmap_xml_uses_avahi_browse_before_per_host_avahi_lookup(self):
+        xml = """<?xml version=\"1.0\"?>
+<nmaprun>
+  <host>
+    <status state=\"up\"/>
+    <address addr=\"10.42.0.54\" addrtype=\"ipv4\"/>
+    <hostnames/>
+  </host>
+</nmaprun>
+"""
+        with mock.patch("lan_inventory_scan_pi.reverse_dns", return_value=""), mock.patch(
+            "lan_inventory_scan_pi.load_dhcp_lease_hostnames", return_value={}
+        ), mock.patch(
+            "lan_inventory_scan_pi.load_avahi_browse_hostnames",
+            return_value={"10.42.0.54": "mirror-pi.local"},
+        ), mock.patch("lan_inventory_scan_pi.resolve_avahi_address") as mocked_avahi:
+            rows = parse_nmap_xml(xml)
+
+        self.assertEqual(rows[0]["hostname"], "mirror-pi.local")
+        mocked_avahi.assert_not_called()
+
+    def test_parse_nmap_xml_uses_dns_name_as_hostname_fallback(self):
+        xml = """<?xml version=\"1.0\"?>
+<nmaprun>
+  <host>
+    <status state=\"up\"/>
+    <address addr=\"192.168.1.200\" addrtype=\"ipv4\"/>
+    <hostnames/>
+  </host>
+</nmaprun>
+"""
+        with mock.patch("lan_inventory_scan_pi.reverse_dns", return_value="cm5.attlocal.net"), mock.patch(
+            "lan_inventory_scan_pi.load_dhcp_lease_hostnames", return_value={}
+        ), mock.patch(
+            "lan_inventory_scan_pi.load_avahi_browse_hostnames", return_value={}
+        ), mock.patch("lan_inventory_scan_pi.resolve_avahi_address") as mocked_avahi:
+            rows = parse_nmap_xml(xml)
+
+        self.assertEqual(rows[0]["hostname"], "cm5.attlocal.net")
+        self.assertEqual(rows[0]["dns_name"], "cm5.attlocal.net")
+        mocked_avahi.assert_not_called()
 
 
 class ChunkScanHelperTests(unittest.TestCase):
