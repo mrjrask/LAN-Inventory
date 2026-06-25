@@ -5,8 +5,10 @@ from unittest import mock
 
 from lan_inventory_scan_pi import (
     expand_to_24_chunks,
+    classify_interface_connection_type,
     filter_raspberry_pis,
     format_duration,
+    get_connection_type,
     load_checkpoint,
     load_avahi_browse_hostnames,
     load_dhcp_lease_hostnames,
@@ -15,6 +17,19 @@ from lan_inventory_scan_pi import (
     save_checkpoint,
     scan_chunks,
 )
+
+
+class ConnectionTypeTests(unittest.TestCase):
+    def test_classifies_common_interface_names(self):
+        self.assertEqual(classify_interface_connection_type("eth0"), "Ethernet")
+        self.assertEqual(classify_interface_connection_type("enp3s0"), "Ethernet")
+        self.assertEqual(classify_interface_connection_type("wlan0"), "Wifi")
+        self.assertEqual(classify_interface_connection_type("docker0"), "Unknown")
+
+    def test_get_connection_type_uses_route_interface(self):
+        completed = mock.Mock(returncode=0, stdout="192.168.1.42 dev wlan0 src 192.168.1.2 uid 1000\n")
+        with mock.patch("lan_inventory_scan_pi.subprocess.run", return_value=completed):
+            self.assertEqual(get_connection_type("192.168.1.42"), "Wifi")
 
 
 class RaspberryPiFilterTests(unittest.TestCase):
@@ -100,6 +115,8 @@ class HostnameResolutionTests(unittest.TestCase):
 </nmaprun>
 """
         with mock.patch("lan_inventory_scan_pi.reverse_dns", return_value=""), mock.patch(
+            "lan_inventory_scan_pi.get_connection_type", return_value="Ethernet"
+        ), mock.patch(
             "lan_inventory_scan_pi.load_dhcp_lease_hostnames",
             return_value={"10.42.0.54": "mirror-pi"},
         ), mock.patch(
@@ -108,6 +125,7 @@ class HostnameResolutionTests(unittest.TestCase):
             rows = parse_nmap_xml(xml)
 
         self.assertEqual(rows[0]["hostname"], "mirror-pi")
+        self.assertEqual(rows[0]["connection_type"], "Ethernet")
         mocked_avahi.assert_not_called()
 
     def test_parse_nmap_xml_falls_back_to_avahi_for_unknown_hotspot_host(self):
@@ -121,6 +139,8 @@ class HostnameResolutionTests(unittest.TestCase):
 </nmaprun>
 """
         with mock.patch("lan_inventory_scan_pi.reverse_dns", return_value=""), mock.patch(
+            "lan_inventory_scan_pi.get_connection_type", return_value="Unknown"
+        ), mock.patch(
             "lan_inventory_scan_pi.load_dhcp_lease_hostnames", return_value={}
         ), mock.patch(
             "lan_inventory_scan_pi.load_avahi_browse_hostnames", return_value={}
@@ -142,6 +162,8 @@ class HostnameResolutionTests(unittest.TestCase):
 </nmaprun>
 """
         with mock.patch("lan_inventory_scan_pi.reverse_dns", return_value=""), mock.patch(
+            "lan_inventory_scan_pi.get_connection_type", return_value="Unknown"
+        ), mock.patch(
             "lan_inventory_scan_pi.load_dhcp_lease_hostnames", return_value={}
         ), mock.patch(
             "lan_inventory_scan_pi.load_avahi_browse_hostnames",
@@ -163,6 +185,8 @@ class HostnameResolutionTests(unittest.TestCase):
 </nmaprun>
 """
         with mock.patch("lan_inventory_scan_pi.reverse_dns", return_value="cm5.attlocal.net"), mock.patch(
+            "lan_inventory_scan_pi.get_connection_type", return_value="Wifi"
+        ), mock.patch(
             "lan_inventory_scan_pi.load_dhcp_lease_hostnames", return_value={}
         ), mock.patch(
             "lan_inventory_scan_pi.load_avahi_browse_hostnames", return_value={}

@@ -16,6 +16,7 @@ The script:
   - DNS name (reverse DNS / PTR lookup)
   - MAC address
   - Manufacturer (vendor/OUI)
+  - Connection type (`Ethernet`, `Wifi`, or `Unknown`) based on the route interface used to reach each host
 - Outputs a CSV file sorted by IP address
 - Can filter output to likely Raspberry Pi devices with `--raspberry-pis` / `--pis`
 - Prints a formatted terminal table for quick viewing
@@ -68,11 +69,12 @@ network_inventory.csv
 | `dns_name` | Reverse DNS (PTR record lookup); may be empty |
 | `mac_address` | MAC address (best on local L2 networks) |
 | `manufacturer` | Vendor derived from MAC OUI |
+| `connection_type` | Whether the route to the host uses an Ethernet or Wifi interface; `Unknown` if the interface cannot be classified |
 
 Example row:
 
 ```csv
-192.168.1.42,my-printer,printer.local,AA:BB:CC:DD:EE:FF,HP
+192.168.1.42,my-printer,printer.local,AA:BB:CC:DD:EE:FF,HP,Ethernet
 ```
 
 ### CLI Table Output
@@ -84,6 +86,7 @@ In addition to CSV export, the script prints a formatted table in the terminal s
 - DNS Name
 - MAC Address
 - Manufacturer
+- Connection Type
 
 ---
 
@@ -176,7 +179,7 @@ The script writes a resume checkpoint to `.lan_inventory_checkpoint.json` after 
 sudo ./lan_inventory_scan_pi.py --timeout 600 --workers 8 --clear-checkpoint
 ```
 
-To show only likely Raspberry Pi devices, with their IP addresses and hostnames, run:
+To show only likely Raspberry Pi devices, with their IP addresses, hostnames, and connection types, run:
 
 ```bash
 sudo ./lan_inventory_scan_pi.py --raspberry-pis --timeout 600

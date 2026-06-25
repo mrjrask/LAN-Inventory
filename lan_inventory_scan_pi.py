@@ -147,6 +147,44 @@ def _parse_ip_addr(ip_output: str) -> str:
     return ""
 
 
+def classify_interface_connection_type(interface: str) -> str:
+    interface = interface.strip()
+    if not interface:
+        return "Unknown"
+
+    wireless_path = os.path.join("/sys/class/net", interface, "wireless")
+    if os.path.isdir(wireless_path) or interface.startswith(("wl", "wifi", "wlan")):
+        return "Wifi"
+    if interface.startswith(("en", "eth")):
+        return "Ethernet"
+    return "Unknown"
+
+
+def _parse_route_get_interface(route_output: str) -> str:
+    parts = route_output.split()
+    if "dev" not in parts:
+        return ""
+    dev_index = parts.index("dev")
+    if dev_index + 1 >= len(parts):
+        return ""
+    return parts[dev_index + 1]
+
+
+def get_connection_type(ip: str) -> str:
+    route_cp = subprocess.run(
+        ["ip", "route", "get", ip],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if route_cp.returncode != 0:
+        return "Unknown"
+
+    interface = _parse_route_get_interface(route_cp.stdout)
+    return classify_interface_connection_type(interface)
+
+
 def get_active_network_cidr() -> str:
     system = platform.system()
     if system != "Linux":
@@ -634,6 +672,7 @@ def parse_nmap_xml(xml_text: str) -> List[Dict[str, str]]:
                 "dns_name": dns_name,
                 "mac_address": mac,
                 "manufacturer": vendor,
+                "connection_type": get_connection_type(ip),
             }
         )
 
@@ -669,11 +708,19 @@ def print_raspberry_pi_summary(rows: List[Dict[str, str]]) -> None:
     print("\nLikely Raspberry Pi Devices:")
     for row in rows:
         hostname = row.get("hostname") or row.get("dns_name") or "(unknown hostname)"
-        print(f"{row.get('ip_address', '')}\t{hostname}")
+        connection_type = row.get("connection_type", "Unknown")
+        print(f"{row.get('ip_address', '')}\t{hostname}\t{connection_type}")
 
 
 def write_csv(rows: List[Dict[str, str]], path: str) -> None:
-    fieldnames = ["ip_address", "hostname", "dns_name", "mac_address", "manufacturer"]
+    fieldnames = [
+        "ip_address",
+        "hostname",
+        "dns_name",
+        "mac_address",
+        "manufacturer",
+        "connection_type",
+    ]
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -688,6 +735,7 @@ def print_table(rows: List[Dict[str, str]]) -> None:
         ("DNS Name", "dns_name"),
         ("MAC Address", "mac_address"),
         ("Manufacturer", "manufacturer"),
+        ("Connection Type", "connection_type"),
     ]
     if not rows:
         print("No hosts found.")
@@ -743,6 +791,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             checkpoint_path=args.checkpoint,
             resume=not args.no_resume,
         )
+
+        for row in combined.values():
+            row.setdefault("connection_type", get_connection_type(row["ip_address"]))
 
         rows = sorted(
             combined.values(),
