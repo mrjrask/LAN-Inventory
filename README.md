@@ -52,6 +52,18 @@ before: it prints the final table once and exits.
 
 ---
 
+## Which Networks Are Scanned
+
+Each entry point detects your machine's active IPv4 network(s) rather than
+scanning a hardcoded range: it finds the subnet of your default-route
+interface, then adds any other private (RFC 1918) or link-local routes it can
+see (useful when you have multiple active interfaces, VLANs, or a
+router-behind-a-router setup). Every network found is expanded into `/24`
+chunks for discovery. Both phases print the ranges and chunks they're about
+to use before scanning starts, so you always know what's in scope.
+
+---
+
 ## Output
 
 Every run writes:
