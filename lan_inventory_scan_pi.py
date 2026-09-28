@@ -1,67 +1,56 @@
 #!/usr/bin/env python3
+"""LAN inventory scanner tuned for Linux / Raspberry Pi OS.
+
+Two-phase, self-paced scan: a fast ping-sweep discovery pass finds every
+live host, then a parallel enrichment pass resolves hostnames, DNS names,
+and connection type for each one -- while a live progress view populates
+the terminal as results arrive. No "how many seconds should this run"
+prompt: the tool estimates its own budget from a small timing sample and
+just gets on with it. Use ``--timeout``/``--enrich-timeout`` only if you
+want a hard ceiling.
+"""
 import argparse
-import concurrent.futures
-import csv
-import glob
 import ipaddress
-import json
 import os
 import platform
-import shutil
-import socket
 import subprocess
 import sys
-import time
-import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
-from typing import Dict, Iterable, List, Sequence, Set, Tuple
+from typing import List, Sequence
 
-OUTPUT_CSV = "network_inventory.csv"
-DEFAULT_CHECKPOINT_PATH = ".lan_inventory_checkpoint.json"
-# nmap populates this from the MAC address OUI when it can see the device MAC.
-RASPBERRY_PI_MANUFACTURER_KEYWORDS = (
-    "raspberry pi",
-    "raspberry pi foundation",
-    "raspberry pi trading",
+from lan_inventory_core import (
+    DEFAULT_CHECKPOINT_PATH,
+    DEFAULT_DISCOVERY_TIMEOUT,
+    DEFAULT_ENRICH_TIMEOUT,
+    DEFAULT_ENRICH_WORKERS,
+    OUTPUT_CSV,
+    expand_to_24_chunks,
+    filter_raspberry_pis,
+    is_root,
+    print_raspberry_pi_summary,
+    print_table,
+    require_tool,
+    sort_rows,
+    write_csv,
 )
-RASPBERRY_PI_HOSTNAME_KEYWORDS = (
-    "raspberrypi",
-    "raspberry-pi",
-    "raspberry_pi",
-    "rpi",
-)
-
-# Common DHCP lease locations used by dnsmasq, NetworkManager shared
-# connections, and systemd-networkd. These often contain hostnames for
-# devices on Raspberry Pi hosted hotspot networks even when PTR DNS is absent.
-DHCP_LEASE_GLOBS = (
-    "/var/lib/misc/dnsmasq.leases",
-    "/var/lib/NetworkManager/dnsmasq*.leases",
-    "/var/lib/NetworkManager/*dnsmasq*.leases",
-    "/run/NetworkManager/dnsmasq*.leases",
-    "/run/NetworkManager/*dnsmasq*.leases",
-    "/run/systemd/netif/leases/*",
-)
-
-
-def require_tool(tool: str) -> None:
-    if shutil.which(tool) is None:
-        print(f"ERROR: Required tool '{tool}' not found. Install it first.", file=sys.stderr)
-        sys.exit(2)
-
-
-def is_root() -> bool:
-    return hasattr(os, "geteuid") and os.geteuid() == 0
+from lan_inventory_ui import run_browser, run_interactive_scan
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Scan local IPv4 networks and inventory discovered LAN hosts."
+        description="Scan local IPv4 networks and inventory discovered LAN hosts (Linux / Raspberry Pi)."
     )
     parser.add_argument(
         "--timeout",
         type=int,
-        help="Maximum seconds to allow each network scan to run. Skips the interactive prompt.",
+        default=DEFAULT_DISCOVERY_TIMEOUT,
+        help=f"Safety ceiling in seconds for the discovery pass (default: {DEFAULT_DISCOVERY_TIMEOUT}). "
+        "Discovery is a bare ping sweep so this is rarely reached.",
+    )
+    parser.add_argument(
+        "--enrich-timeout",
+        type=int,
+        default=DEFAULT_ENRICH_TIMEOUT,
+        help=f"Safety ceiling in seconds for the hostname/DNS/route enrichment pass (default: {DEFAULT_ENRICH_TIMEOUT}).",
     )
     parser.add_argument(
         "--raspberry-pis",
@@ -73,7 +62,13 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         "--workers",
         type=int,
         default=4,
-        help="Number of /24 chunks to scan in parallel (default: 4).",
+        help="Number of /24 chunks to scan in parallel during discovery (default: 4).",
+    )
+    parser.add_argument(
+        "--enrich-workers",
+        type=int,
+        default=DEFAULT_ENRICH_WORKERS,
+        help=f"Number of hosts to enrich in parallel (default: {DEFAULT_ENRICH_WORKERS}).",
     )
     parser.add_argument(
         "--checkpoint",
@@ -90,36 +85,18 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         action="store_true",
         help="Remove the checkpoint file after a successful scan.",
     )
+    parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="Skip the interactive sort/search browser after the scan, even in a terminal.",
+    )
     return parser.parse_args(argv)
-
-
-def get_timeout_seconds(args: argparse.Namespace, default: int = 600) -> int:
-    if args.timeout is None:
-        return prompt_timeout_seconds(default=default)
-    if args.timeout <= 0:
-        raise ValueError("--timeout must be a positive integer.")
-    return args.timeout
 
 
 def get_worker_count(args: argparse.Namespace) -> int:
     if args.workers <= 0:
         raise ValueError("--workers must be a positive integer.")
     return args.workers
-
-
-def prompt_timeout_seconds(default: int = 600) -> int:
-    while True:
-        raw = input(f"How many seconds should the scan run for? [{default}]: ").strip()
-        if not raw:
-            return default
-        try:
-            val = int(raw)
-            if val <= 0:
-                print("Please enter a positive integer.")
-                continue
-            return val
-        except ValueError:
-            print("Please enter a valid integer (seconds).")
 
 
 def _parse_default_interface(route_output: str) -> str:
@@ -258,515 +235,6 @@ def get_scan_networks() -> List[str]:
     return [str(n) for n in sorted(networks, key=lambda n: (int(n.network_address), n.prefixlen))]
 
 
-def expand_to_24_chunks(networks: Iterable[str]) -> List[str]:
-    chunks: Set[ipaddress.IPv4Network] = set()
-    for network_text in networks:
-        network = ipaddress.ip_network(network_text, strict=False)
-        if network.version != 4:
-            continue
-        if network.prefixlen <= 24:
-            chunks.update(network.subnets(new_prefix=24))
-        else:
-            chunks.add(network)
-    return [str(n) for n in sorted(chunks, key=lambda n: (int(n.network_address), n.prefixlen))]
-
-
-def load_checkpoint(path: str, resume: bool) -> Tuple[Set[str], Dict[str, Dict[str, str]]]:
-    if not resume or not os.path.exists(path):
-        return set(), {}
-
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    completed = set(data.get("completed_chunks", []))
-    hosts = {
-        ip: row
-        for ip, row in data.get("hosts", {}).items()
-        if isinstance(ip, str) and isinstance(row, dict)
-    }
-    print(
-        f"Resuming from checkpoint: {len(completed)} completed chunk(s), "
-        f"{len(hosts)} discovered host(s)."
-    )
-    return completed, hosts
-
-
-def save_checkpoint(path: str, completed_chunks: Set[str], hosts: Dict[str, Dict[str, str]]) -> None:
-    data = {
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "completed_chunks": sorted(
-            completed_chunks,
-            key=lambda n: int(ipaddress.ip_network(n, strict=False).network_address),
-        ),
-        "hosts": hosts,
-    }
-    directory = os.path.dirname(os.path.abspath(path))
-    os.makedirs(directory, exist_ok=True)
-    temp_path = f"{path}.tmp"
-    with open(temp_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, sort_keys=True)
-        f.write("\n")
-    os.replace(temp_path, path)
-
-
-def format_duration(seconds: float) -> str:
-    if seconds < 0 or seconds == float("inf"):
-        return "unknown"
-    minutes, secs = divmod(int(seconds), 60)
-    hours, minutes = divmod(minutes, 60)
-    if hours:
-        return f"{hours}h {minutes}m {secs}s"
-    if minutes:
-        return f"{minutes}m {secs}s"
-    return f"{secs}s"
-
-
-def print_progress(completed: int, total: int, start_time: float) -> None:
-    elapsed = time.time() - start_time
-    if completed:
-        eta = (elapsed / completed) * (total - completed)
-    else:
-        eta = float("inf")
-    percent = (completed / total * 100) if total else 100
-    print(
-        f"Progress: {completed}/{total} chunks ({percent:.1f}%) | "
-        f"elapsed {format_duration(elapsed)} | ETA {format_duration(eta)}"
-    )
-
-
-def run_nmap_scan(network: str, timeout_s: float) -> str:
-    require_tool("nmap")
-
-    cmd = ["nmap", "-sn", network, "-oX", "-"]
-
-    start = time.time()
-    deadline = start + timeout_s
-
-    def _remaining_timeout() -> float:
-        remaining = deadline - time.time()
-        if remaining <= 0:
-            raise subprocess.TimeoutExpired(cmd, timeout_s)
-        return remaining
-
-    def _run_scan(scan_cmd: List[str]) -> subprocess.CompletedProcess[str]:
-        print(f"Running scan: {' '.join(scan_cmd)}")
-        return subprocess.run(
-            scan_cmd,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=_remaining_timeout(),
-            check=False,
-        )
-
-    try:
-        cp = _run_scan(cmd)
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"Scan exceeded timeout of {format_duration(timeout_s)}")
-
-    retry_triggers = (
-        "Required key not available",
-        "Destination address required",
-    )
-    should_retry_unprivileged = any(trigger in cp.stderr for trigger in retry_triggers)
-    if should_retry_unprivileged:
-        print(
-            "Detected kernel policy/routing errors for raw ICMP probes; "
-            "retrying with unprivileged TCP ping probes.",
-            file=sys.stderr,
-        )
-        try:
-            cp = _run_scan(
-                [
-                    "nmap",
-                    "--unprivileged",
-                    "-sn",
-                    "-PS22,80,443",
-                    "-PA22,80,443",
-                    network,
-                    "-oX",
-                    "-",
-                ]
-            )
-        except subprocess.TimeoutExpired:
-            raise RuntimeError(f"Scan exceeded timeout of {format_duration(timeout_s)}")
-
-    elapsed = time.time() - start
-
-    if cp.returncode != 0 and not cp.stdout.strip():
-        raise RuntimeError(
-            f"nmap failed (exit {cp.returncode}).\n"
-            f"stderr:\n{cp.stderr.strip()}"
-        )
-
-    if cp.stderr.strip():
-        print(f"[nmap stderr]\n{cp.stderr.strip()}", file=sys.stderr)
-
-    print(f"Scan completed in {elapsed:.1f} seconds. Parsing results...")
-    return cp.stdout
-
-
-def scan_chunk(network: str, timeout_s: float) -> Tuple[str, List[Dict[str, str]]]:
-    xml_data = run_nmap_scan(network, timeout_s)
-    return network, parse_nmap_xml(xml_data)
-
-
-def scan_chunks(
-    chunks: List[str],
-    timeout_s: float,
-    workers: int,
-    checkpoint_path: str,
-    resume: bool,
-) -> Dict[str, Dict[str, str]]:
-    completed_chunks, combined = load_checkpoint(checkpoint_path, resume=resume)
-    pending_chunks = [chunk for chunk in chunks if chunk not in completed_chunks]
-
-    if completed_chunks and not pending_chunks:
-        print(
-            "Checkpoint already contains every requested chunk; starting a fresh scan "
-            "so completed results do not hide current network changes."
-        )
-        completed_chunks = set()
-        combined = {}
-        pending_chunks = list(chunks)
-    elif completed_chunks:
-        print(f"Skipping {len(chunks) - len(pending_chunks)} already completed chunk(s).")
-
-    print(f"Scanning {len(pending_chunks)} /24 chunk(s) with {workers} worker(s).")
-    start_time = time.time()
-    deadline = start_time + timeout_s
-    finished_this_run = 0
-    print_progress(finished_this_run, len(pending_chunks), start_time)
-
-    def remaining_budget() -> float:
-        return deadline - time.time()
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-        chunk_iter = iter(pending_chunks)
-        future_to_chunk: Dict[concurrent.futures.Future[Tuple[str, List[Dict[str, str]]]], str] = {}
-
-        def submit_next_chunk() -> bool:
-            if remaining_budget() <= 0:
-                return False
-            try:
-                next_chunk = next(chunk_iter)
-            except StopIteration:
-                return False
-            future_to_chunk[executor.submit(scan_chunk, next_chunk, remaining_budget())] = next_chunk
-            return True
-
-        for _ in range(min(workers, len(pending_chunks))):
-            submit_next_chunk()
-
-        while future_to_chunk:
-            done, _not_done = concurrent.futures.wait(
-                future_to_chunk,
-                timeout=max(0.0, remaining_budget()),
-                return_when=concurrent.futures.FIRST_COMPLETED,
-            )
-            if not done:
-                save_checkpoint(checkpoint_path, completed_chunks, combined)
-                raise RuntimeError(
-                    f"Global scan timeout of {format_duration(timeout_s)} exceeded. "
-                    f"Checkpoint saved to {checkpoint_path}; rerun to resume."
-                )
-
-            for future in done:
-                chunk = future_to_chunk.pop(future)
-                try:
-                    completed_chunk, rows = future.result()
-                except Exception as exc:
-                    save_checkpoint(checkpoint_path, completed_chunks, combined)
-                    raise RuntimeError(
-                        f"Chunk {chunk} failed: {exc}. "
-                        f"Checkpoint saved to {checkpoint_path}; rerun to resume."
-                    ) from exc
-
-                for row in rows:
-                    combined.setdefault(row["ip_address"], row)
-                completed_chunks.add(completed_chunk)
-                finished_this_run += 1
-                save_checkpoint(checkpoint_path, completed_chunks, combined)
-                print(
-                    f"Completed {completed_chunk}: {len(rows)} active host(s), "
-                    f"{len(combined)} unique host(s) total."
-                )
-                print_progress(finished_this_run, len(pending_chunks), start_time)
-                submit_next_chunk()
-
-    return combined
-
-
-def reverse_dns(ip: str) -> str:
-    """
-    Reverse DNS (PTR) lookup. Returns '' if none.
-    """
-    try:
-        name, _aliases, _addrs = socket.gethostbyaddr(ip)
-        return name or ""
-    except Exception:
-        return ""
-
-
-def _clean_hostname(hostname: str) -> str:
-    hostname = hostname.strip()
-    if not hostname or hostname == "*":
-        return ""
-    return hostname
-
-
-def _parse_dnsmasq_lease_line(line: str) -> Tuple[str, str]:
-    parts = line.split()
-    if len(parts) < 4:
-        return "", ""
-    return parts[2], _clean_hostname(parts[3])
-
-
-def _parse_systemd_lease_text(text: str) -> Tuple[str, str]:
-    ip = ""
-    hostname = ""
-    for line in text.splitlines():
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        if key == "ADDRESS":
-            ip = value.strip()
-        elif key == "HOSTNAME":
-            hostname = _clean_hostname(value)
-    return ip, hostname
-
-
-def load_dhcp_lease_hostnames(lease_globs: Sequence[str] = DHCP_LEASE_GLOBS) -> Dict[str, str]:
-    hostnames: Dict[str, str] = {}
-    paths: Set[str] = set()
-    for pattern in lease_globs:
-        paths.update(glob.glob(pattern))
-
-    for path in sorted(paths):
-        try:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                text = f.read()
-        except OSError:
-            continue
-
-        if "ADDRESS=" in text or "HOSTNAME=" in text:
-            ip, hostname = _parse_systemd_lease_text(text)
-            if ip and hostname:
-                hostnames.setdefault(ip, hostname)
-            continue
-
-        for line in text.splitlines():
-            ip, hostname = _parse_dnsmasq_lease_line(line)
-            if ip and hostname:
-                hostnames.setdefault(ip, hostname)
-
-    return hostnames
-
-
-def resolve_avahi_address(ip: str) -> str:
-    avahi_tool = shutil.which("avahi-resolve-address")
-    if avahi_tool is None:
-        return ""
-
-    cp = subprocess.run(
-        [avahi_tool, ip],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        timeout=3,
-        check=False,
-    )
-    if cp.returncode != 0:
-        return ""
-
-    parts = cp.stdout.strip().split()
-    if len(parts) >= 2 and parts[0] == ip:
-        return _clean_hostname(parts[1].rstrip("."))
-    return ""
-
-
-def _parse_avahi_browse_line(line: str) -> Tuple[str, str]:
-    # avahi-browse --parsable resolved lines are semicolon-separated and start
-    # with '='. The hostname and IPv4 address are the seventh and eighth fields.
-    parts = line.split(";")
-    if len(parts) < 8 or parts[0] != "=" or parts[2] != "IPv4":
-        return "", ""
-    hostname = _clean_hostname(parts[6].rstrip("."))
-    ip = parts[7].strip()
-    return ip, hostname
-
-
-def load_avahi_browse_hostnames() -> Dict[str, str]:
-    avahi_tool = shutil.which("avahi-browse")
-    if avahi_tool is None:
-        return {}
-
-    try:
-        cp = subprocess.run(
-            [avahi_tool, "--all", "--resolve", "--terminate", "--parsable"],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=5,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        return {}
-
-    if cp.returncode != 0:
-        return {}
-
-    hostnames: Dict[str, str] = {}
-    for line in cp.stdout.splitlines():
-        ip, hostname = _parse_avahi_browse_line(line)
-        if ip and hostname:
-            hostnames.setdefault(ip, hostname)
-    return hostnames
-
-
-def parse_nmap_xml(xml_text: str) -> List[Dict[str, str]]:
-    root = ET.fromstring(xml_text)
-    results: List[Dict[str, str]] = []
-    dhcp_lease_hostnames = load_dhcp_lease_hostnames()
-    avahi_browse_hostnames = load_avahi_browse_hostnames()
-
-    for host in root.findall("host"):
-        status = host.find("status")
-        if status is None or status.get("state") != "up":
-            continue
-
-        ip = ""
-        mac = ""
-        vendor = ""
-
-        for addr in host.findall("address"):
-            addrtype = addr.get("addrtype")
-            if addrtype == "ipv4":
-                ip = addr.get("addr", "") or ""
-            elif addrtype == "mac":
-                mac = addr.get("addr", "") or ""
-                vendor = addr.get("vendor", "") or ""
-
-        if not ip:
-            continue
-
-        # "hostname" from nmap (can be DNS, mDNS, NetBIOS depending on environment)
-        nmap_hostname = ""
-        hostnames = host.find("hostnames")
-        if hostnames is not None:
-            hn = hostnames.find("hostname")
-            if hn is not None:
-                nmap_hostname = hn.get("name", "") or ""
-
-        dns_name = reverse_dns(ip)
-        lease_hostname = dhcp_lease_hostnames.get(ip, "")
-        avahi_hostname = avahi_browse_hostnames.get(ip, "")
-        if not (dns_name or lease_hostname or nmap_hostname or avahi_hostname):
-            avahi_hostname = resolve_avahi_address(ip)
-        hostname = nmap_hostname or lease_hostname or avahi_hostname or dns_name
-
-        results.append(
-            {
-                "ip_address": ip,
-                "hostname": hostname,
-                "dns_name": dns_name,
-                "mac_address": mac,
-                "manufacturer": vendor,
-                "connection_type": get_connection_type(ip),
-            }
-        )
-
-    def ip_sort_key(item: Dict[str, str]) -> Tuple[int, int, int, int]:
-        ip_obj = ipaddress.ip_address(item["ip_address"])
-        return tuple(int(o) for o in str(ip_obj).split("."))
-
-    results.sort(key=ip_sort_key)
-    return results
-
-
-def is_likely_raspberry_pi(row: Dict[str, str]) -> bool:
-    manufacturer = row.get("manufacturer", "").lower()
-    hostname = row.get("hostname", "").lower()
-    dns_name = row.get("dns_name", "").lower()
-
-    return any(keyword in manufacturer for keyword in RASPBERRY_PI_MANUFACTURER_KEYWORDS) or any(
-        keyword in name
-        for keyword in RASPBERRY_PI_HOSTNAME_KEYWORDS
-        for name in (hostname, dns_name)
-    )
-
-
-def filter_raspberry_pis(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    return [row for row in rows if is_likely_raspberry_pi(row)]
-
-
-def print_raspberry_pi_summary(rows: List[Dict[str, str]]) -> None:
-    if not rows:
-        print("No likely Raspberry Pi devices found.")
-        return
-
-    print("\nLikely Raspberry Pi Devices:")
-    for row in rows:
-        hostname = row.get("hostname") or row.get("dns_name") or "(unknown hostname)"
-        connection_type = row.get("connection_type", "Unknown")
-        print(f"{row.get('ip_address', '')}\t{hostname}\t{connection_type}")
-
-
-def write_csv(rows: List[Dict[str, str]], path: str) -> None:
-    fieldnames = [
-        "ip_address",
-        "hostname",
-        "dns_name",
-        "mac_address",
-        "manufacturer",
-        "connection_type",
-    ]
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({k: row.get(k, "") for k in fieldnames})
-
-
-def print_table(rows: List[Dict[str, str]]) -> None:
-    columns = [
-        ("IP Address", "ip_address"),
-        ("Hostname", "hostname"),
-        ("DNS Name", "dns_name"),
-        ("MAC Address", "mac_address"),
-        ("Manufacturer", "manufacturer"),
-        ("Connection Type", "connection_type"),
-    ]
-    if not rows:
-        print("No hosts found.")
-        return
-
-    max_col_width = 40
-    widths: List[int] = []
-    for title, key in columns:
-        max_value_len = max(len(str(row.get(key, ""))) for row in rows)
-        widths.append(min(max(len(title), max_value_len), max_col_width))
-
-    def fit(text: str, width: int) -> str:
-        if len(text) <= width:
-            return text.ljust(width)
-        if width <= 3:
-            return text[:width]
-        return f"{text[: width - 3]}...".ljust(width)
-
-    header = " | ".join(fit(title, width) for (title, _), width in zip(columns, widths))
-    separator = "-+-".join("-" * width for width in widths)
-    print("\nDiscovered Hosts:")
-    print(header)
-    print(separator)
-    for row in rows:
-        line = " | ".join(
-            fit(str(row.get(key, "")), width)
-            for (_, key), width in zip(columns, widths)
-        )
-        print(line)
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
     if not is_root():
@@ -777,28 +245,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
     try:
-        timeout_s = get_timeout_seconds(args, default=600)
         workers = get_worker_count(args)
         networks = get_scan_networks()
         print(f"Scanning ranges: {', '.join(networks)}")
         chunks = expand_to_24_chunks(networks)
         print(f"Expanded to /24 scan chunks: {', '.join(chunks)}")
 
-        combined = scan_chunks(
+        combined = run_interactive_scan(
             chunks=chunks,
-            timeout_s=timeout_s,
-            workers=workers,
+            discovery_timeout=args.timeout,
+            discovery_workers=workers,
+            enrich_timeout=args.enrich_timeout,
+            enrich_workers=args.enrich_workers,
             checkpoint_path=args.checkpoint,
             resume=not args.no_resume,
+            get_connection_type=get_connection_type,
         )
 
-        for row in combined.values():
-            row.setdefault("connection_type", get_connection_type(row["ip_address"]))
-
-        rows = sorted(
-            combined.values(),
-            key=lambda item: tuple(int(o) for o in item["ip_address"].split(".")),
-        )
+        rows = sort_rows(list(combined.values()), "ip")
         if args.raspberry_pis:
             display_rows = filter_raspberry_pis(rows)
             print_raspberry_pi_summary(display_rows)
@@ -816,6 +280,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.clear_checkpoint and os.path.exists(args.checkpoint):
             os.remove(args.checkpoint)
             print(f"Removed checkpoint: {args.checkpoint}")
+
+        if not args.no_browser and rows and sys.stdin.isatty():
+            run_browser(rows)
+
         return 0
 
     except Exception as e:
