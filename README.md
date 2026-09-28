@@ -1,60 +1,60 @@
-# LAN Inventory Scanner (Raspberry Pi)
+# LAN Inventory Scanner
 
-This project provides a terminal-based Python script that scans an entire private IPv4 range
-(`192.168.0.1` through `192.168.255.255`) and generates a CSV inventory of devices found on the local network.
-
-The script:
-
-- Prompts the user at launch for **how many seconds the scan should run** unless `--timeout` is provided
-- Performs host discovery using **nmap**
-- Splits broad IPv4 ranges into parallel `/24` scan chunks
-- Shows scan progress, elapsed time, and ETA while chunks complete
-- Saves a checkpoint after each chunk so interrupted scans can resume
-- Captures:
-  - IP address
-  - Hostname (from nmap, local DHCP leases, reverse DNS, or mDNS/Avahi fallback)
-  - DNS name (reverse DNS / PTR lookup)
-  - MAC address
-  - Manufacturer (vendor/OUI)
-  - Connection type (`Ethernet`, `Wifi`, or `Unknown`) based on the route interface used to reach each host
-- Outputs a CSV file sorted by IP address
-- Can filter output to likely Raspberry Pi devices with `--raspberry-pis` / `--pis`
-- Prints a formatted terminal table for quick viewing
-- Works best when run with **administrator/root privileges**
-
----
-
-## Files
+Terminal-based Python scanners that discover devices on your local network and
+generate a CSV inventory. There is one entry point per platform, sharing a
+common engine:
 
 | Script | Platform |
 |------|----------|
-| `lan_inventory_scan_pi.py` | Raspberry Pi OS (Bookworm & Trixie) |
-| `install_pi_dependencies.sh` | Raspberry Pi OS installer for scanner dependencies |
+| `lan_inventory_scan_pi.py` | Linux / Raspberry Pi OS (Bookworm & Trixie) |
+| `lan_inventory_scan_macos.py` | macOS |
+| `lan_inventory_scan_windows.py` | Windows |
+
+No `pip install` is required for any of them -- everything is standard
+library.
 
 ---
 
-## Network Range Scanned
+## How a scan works
 
-The scan range is fixed to:
+The scan runs in two phases, fully automatically -- there's no "how many
+seconds should this run?" prompt:
+
+1. **Discovery.** A fast ping sweep (`nmap -sn`) finds every live host on
+   your subnet(s) and reports its IP, MAC address, and vendor. This is a
+   bare host-discovery pass with DNS resolution turned off, so it typically
+   takes seconds, not minutes, even across several `/24` ranges.
+2. **Enrichment.** Once the tool knows how many hosts exist, it times a
+   small sample of them to estimate how long full detail-gathering
+   (hostname resolution, reverse DNS, mDNS/Avahi, connection type) will
+   take, prints that estimate, and then resolves every host in parallel.
+
+While enrichment runs, a live progress bar and a table of already-resolved
+hosts redraw in place in your terminal, so you see devices appear as they're
+found instead of staring at a blank screen. When the scan finishes (or you
+press Ctrl+C to stop early -- partial results are still written), you land in
+an interactive browser over the results:
 
 ```
-192.168.0.0/16
+sort <column> [desc]   Sort by column: ip, hostname, dns, mac, vendor, connection
+search <text>          Filter rows containing text in any column (case-insensitive)
+clear                  Clear the current search filter
+pis                    Show only likely Raspberry Pi devices
+all                    Show all discovered hosts (clears the Raspberry Pi filter)
+csv [path]             Write the currently filtered/sorted rows to a CSV file
+help                   Show this help
+quit / exit / q        Exit the browser
 ```
 
-This covers:
-
-```
-192.168.0.1 → 192.168.255.255
-```
-
-This ensures **maximum coverage** of typical home and small-business networks, even if multiple
-`/24` subnets exist behind routers, VLANs, or mesh systems.
+The browser is skipped automatically when stdin isn't a terminal (piped
+input, CI, cron/systemd-timer runs), so scripted usage behaves exactly like
+before: it prints the final table once and exits.
 
 ---
 
 ## Output
 
-The script generates:
+Every run writes:
 
 ```
 network_inventory.csv
@@ -65,11 +65,11 @@ network_inventory.csv
 | Column | Description |
 |------|-------------|
 | `ip_address` | IPv4 address of the host |
-| `hostname` | Hostname from nmap first, then local DHCP lease files, then Avahi/mDNS service discovery or address resolution, then reverse DNS |
+| `hostname` | Hostname from nmap first, then local DHCP lease files, then Avahi/mDNS, then reverse DNS |
 | `dns_name` | Reverse DNS (PTR record lookup); may be empty |
 | `mac_address` | MAC address (best on local L2 networks) |
 | `manufacturer` | Vendor derived from MAC OUI |
-| `connection_type` | Whether the route to the host uses an Ethernet or Wifi interface; `Unknown` if the interface cannot be classified |
+| `connection_type` | `Ethernet`, `Wifi`, or `Unknown` |
 
 Example row:
 
@@ -77,46 +77,33 @@ Example row:
 192.168.1.42,my-printer,printer.local,AA:BB:CC:DD:EE:FF,HP,Ethernet
 ```
 
-### CLI Table Output
+---
 
-In addition to CSV export, the script prints a formatted table in the terminal showing:
+## Safety Notes
 
-- IP Address
-- Hostname
-- DNS Name
-- MAC Address
-- Manufacturer
-- Connection Type
+- These scripts perform **host discovery only**
+- No ports are scanned
+- No services are touched
+- Safe for home and business networks where you have authorization
+
+Do not run on networks you do not own or manage.
 
 ---
 
-## Raspberry Pi Version
-
-### Supported OS Versions
-
-- Raspberry Pi OS **Bookworm**
-- Raspberry Pi OS **Trixie**
+## Linux / Raspberry Pi
 
 ### Requirements
-
-Use the included installer script (recommended):
 
 ```bash
 chmod +x install_pi_dependencies.sh
 ./install_pi_dependencies.sh
 ```
 
-Or install manually:
+Or manually:
 
 ```bash
 sudo apt update
 sudo apt install -y nmap python3 iproute2
-```
-
-### Script Name
-
-```
-lan_inventory_scan_pi.py
 ```
 
 ### Run
@@ -126,95 +113,118 @@ chmod +x lan_inventory_scan_pi.py
 sudo ./lan_inventory_scan_pi.py
 ```
 
+`sudo` is optional but strongly recommended -- without it, MAC addresses and
+manufacturer/vendor detection are often unavailable.
 
-### Command-Line Flags
+---
 
-Run `./lan_inventory_scan_pi.py --help` to print the built-in help text. The scanner supports these flags:
+## macOS
+
+### Requirements
+
+```bash
+chmod +x install_macos_dependencies.sh
+./install_macos_dependencies.sh
+```
+
+Or manually (via [Homebrew](https://brew.sh)):
+
+```bash
+brew install nmap
+```
+
+### Run
+
+```bash
+chmod +x lan_inventory_scan_macos.py
+sudo ./lan_inventory_scan_macos.py
+```
+
+Network detection uses `route -n get` and `ifconfig`; Wi-Fi vs. Ethernet
+classification uses `networksetup -listallhardwareports` (macOS interface
+names like `en0` don't reliably indicate media type on their own).
+
+---
+
+## Windows
+
+### Requirements
+
+Run from an **elevated PowerShell prompt**:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\install_windows_dependencies.ps1
+```
+
+This installs `nmap` (which bundles the Npcap capture driver it needs) via
+`winget` or Chocolatey, whichever is available. If neither is installed,
+download nmap directly from <https://nmap.org/download.html#windows>.
+
+### Run
+
+```powershell
+python .\lan_inventory_scan_windows.py
+```
+
+Network detection and Wi-Fi/Ethernet classification use PowerShell's
+`Get-NetIPAddress`/`Get-NetAdapter`/`Get-NetRoute` cmdlets, loaded once per
+run rather than once per host (spawning PowerShell per discovered device
+would be far slower than the enrichment work it's classifying).
+
+---
+
+## Command-Line Flags
+
+All three entry points accept the same flags; run `--help` on any of them for
+the full built-in text.
 
 | Flag | Value | Default | Description |
 |------|-------|---------|-------------|
-| `-h`, `--help` | none | n/a | Prints the command-line help and exits without scanning. |
-| `--timeout` | positive integer seconds | interactive prompt, default prompt value `600` | Sets the total scan time budget in seconds and skips the launch prompt. The value must be greater than zero. |
-| `--raspberry-pis`, `--pis` | none | disabled | Filters the terminal output and CSV to only likely Raspberry Pi devices. Matching uses Raspberry Pi MAC vendor/manufacturer data first, then common Raspberry Pi hostname and reverse-DNS patterns. |
-| `--workers` | positive integer | `4` | Sets how many scan chunks run in parallel. Higher values can finish faster but may increase CPU, network, and router load. The value must be greater than zero. |
-| `--checkpoint` | filesystem path | `.lan_inventory_checkpoint.json` | Chooses where scan progress is saved. Completed chunks and discovered hosts are written after each chunk so interrupted scans can resume. |
-| `--no-resume` | none | disabled | Ignores any existing checkpoint file and starts a fresh scan. The checkpoint path is still used for saving progress during the new run. |
-| `--clear-checkpoint` | none | disabled | Deletes the checkpoint file after a successful scan. This is useful when you do not want a completed checkpoint to remain after CSV output is written. |
+| `-h`, `--help` | none | n/a | Prints help and exits. |
+| `--timeout` | positive integer seconds | `120` | Safety ceiling for the discovery pass. Discovery is a bare ping sweep, so this is rarely approached -- it exists purely as a fallback, not something you need to tune. |
+| `--enrich-timeout` | positive integer seconds | `180` | Safety ceiling for the hostname/DNS/route enrichment pass. |
+| `--raspberry-pis`, `--pis` | none | disabled | Filters the terminal output and CSV to only likely Raspberry Pi devices. |
+| `--workers` | positive integer | `4` | Number of `/24` chunks scanned in parallel during discovery. |
+| `--enrich-workers` | positive integer | `16` | Number of hosts enriched in parallel. |
+| `--checkpoint` | filesystem path | `.lan_inventory_checkpoint.json` | Where discovery progress is saved so an interrupted scan can resume. |
+| `--no-resume` | none | disabled | Ignore any existing checkpoint and start a fresh scan. |
+| `--clear-checkpoint` | none | disabled | Delete the checkpoint file after a successful scan. |
+| `--no-browser` | none | disabled | Skip the interactive sort/search browser after the scan, even in a terminal. |
 
 Common examples:
 
 ```bash
-# Run for ten minutes using the default checkpoint and four workers
-sudo ./lan_inventory_scan_pi.py --timeout 600
+# Default: auto-paced discovery + enrichment, live progress, browse after
+sudo ./lan_inventory_scan_pi.py
 
-# Run with more parallel scan chunks
-sudo ./lan_inventory_scan_pi.py --timeout 600 --workers 8
+# More parallel discovery chunks
+sudo ./lan_inventory_scan_pi.py --workers 8
 
 # Save progress to a custom checkpoint path
-sudo ./lan_inventory_scan_pi.py --timeout 600 --checkpoint ./checkpoints/home-lan.json
+sudo ./lan_inventory_scan_pi.py --checkpoint ./checkpoints/home-lan.json
 
-# Start fresh even if a checkpoint exists, then remove the checkpoint after success
-sudo ./lan_inventory_scan_pi.py --timeout 600 --no-resume --clear-checkpoint
+# Start fresh even if a checkpoint exists, then remove it after success
+sudo ./lan_inventory_scan_pi.py --no-resume --clear-checkpoint
 
-# Output only likely Raspberry Pi devices
-sudo ./lan_inventory_scan_pi.py --timeout 600 --raspberry-pis
-sudo ./lan_inventory_scan_pi.py --timeout 600 --pis
+# Output only likely Raspberry Pi devices, and skip the interactive browser
+sudo ./lan_inventory_scan_pi.py --pis --no-browser
 ```
 
-To skip the interactive timeout prompt:
-
-```bash
-sudo ./lan_inventory_scan_pi.py --timeout 600
-```
-
-Scan chunks run in parallel by default. Adjust concurrency with `--workers`:
-
-```bash
-sudo ./lan_inventory_scan_pi.py --timeout 600 --workers 8
-```
-
-The script writes a resume checkpoint to `.lan_inventory_checkpoint.json` after each completed chunk. If a scan is interrupted, rerun the same command to skip completed chunks and continue. Use `--no-resume` to ignore an existing checkpoint, `--checkpoint PATH` to choose a different checkpoint file, or `--clear-checkpoint` to delete the checkpoint after a successful scan:
-
-```bash
-sudo ./lan_inventory_scan_pi.py --timeout 600 --workers 8 --clear-checkpoint
-```
-
-To show only likely Raspberry Pi devices, with their IP addresses, hostnames, and connection types, run:
-
-```bash
-sudo ./lan_inventory_scan_pi.py --raspberry-pis --timeout 600
-```
-
-The shorter alias is also supported:
-
-```bash
-sudo ./lan_inventory_scan_pi.py --pis --timeout 600
-```
-
-Yes: manufacturer matching helps a lot when nmap can see each device MAC address. Raspberry Pi filtering first checks whether the MAC vendor/manufacturer identifies Raspberry Pi hardware, then falls back to discovered hostname / reverse DNS names containing common Raspberry Pi names such as `raspberrypi`, `raspberry-pi`, `raspberry_pi`, or `rpi`.
-
-At launch, without `--timeout`, the script will ask:
-
-```
-How many seconds should the scan run for? [600]:
-```
-
-Enter the desired timeout in seconds, or press **Enter** to accept the default.
+If a scan is interrupted (Ctrl+C, network drop, exceeding `--timeout`), the
+discovery checkpoint lets you resume with the same command -- already
+completed `/24` chunks are skipped.
 
 ---
 
-## Why Root / sudo Is Strongly Recommended
+## Why Root / Administrator Is Recommended
 
-Running without elevated privileges will still work, but with limitations:
-
-| Feature | Without sudo | With sudo |
+| Feature | Without elevated privileges | With elevated privileges |
 |------|-------------|-----------|
 | MAC addresses | Often missing | Reliable |
 | Manufacturer | Often missing | Reliable |
 | ARP discovery | Limited | Full |
 | Host visibility | Reduced | Maximum |
-
-For best results, always use `sudo`.
 
 ---
 
@@ -222,39 +232,32 @@ For best results, always use `sudo`.
 
 - **hostname**
   - Uses nmap-reported names first
-  - Falls back to local DHCP lease files used by common Raspberry Pi hotspot setups (for example dnsmasq, NetworkManager shared connections, and systemd-networkd)
-  - Falls back again to Avahi/mDNS service discovery when `avahi-browse` is installed, then per-host mDNS address resolution when `avahi-resolve-address` is installed
+  - Falls back to local DHCP lease files used by common hotspot setups (dnsmasq, NetworkManager shared connections, systemd-networkd)
+  - Falls back again to Avahi/mDNS service discovery when `avahi-browse`/`avahi-resolve-address` are installed (Linux only)
   - Falls back to the reverse-DNS value when that is the only discovered name
 - **dns_name**
   - Result of a strict reverse DNS (PTR) lookup
   - Often empty on home networks unless your router maintains PTR records
 
-They may differ — this is expected and intentional. On Raspberry Pi hotspot networks, reverse DNS is often empty, but the hotspot DHCP lease file can still provide the client hostname. The Raspberry Pi-only flag checks both values so it can still find devices when MAC vendor information is unavailable.
+They may differ -- this is expected and intentional.
 
 ---
 
-## Performance Expectations
+## Architecture
 
-A `/16` scan includes **65,536 possible addresses**.
+- `lan_inventory_core.py` -- platform-independent engine: nmap invocation and
+  XML parsing, checkpointing, hostname enrichment, CSV output, sort/filter
+  helpers.
+- `lan_inventory_ui.py` -- the live progress view and the interactive
+  sort/search browser, built on the standard library only (ANSI escape
+  redraws + a small REPL), plus the discovery -> estimate -> enrichment
+  orchestration shared by every platform entry point.
+- `lan_inventory_scan_pi.py` / `lan_inventory_scan_macos.py` /
+  `lan_inventory_scan_windows.py` -- platform-specific network detection and
+  connection-type classification, plus each platform's CLI.
 
-Typical scan times:
-- Small LAN: several minutes
-- Busy or filtered networks: longer
-- Wi-Fi environments: slower than wired
+Run the test suite with:
 
-Implemented scanner features include parallel `/24` chunk scanning, progress / ETA output, and resume checkpointing. Future enhancements that can be added cleanly include SQLite output and scheduled scans with a systemd timer.
-
----
-
-## Safety Notes
-
-- This script performs **host discovery only**
-- No ports are scanned
-- No services are touched
-- Safe for home and business networks where you have authorization
-
-Do not run on networks you do not own or manage.
-
----
-
-## Summary
+```bash
+python3 -m unittest discover -s tests -v
+```
